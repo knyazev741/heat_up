@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  heat_up:
+    build: .
+    container_name: heat_up_service
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TELEGRAM_API_BASE_URL=${TELEGRAM_API_BASE_URL}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - heat_up_network
+
+networks:
+  heat_up_network:
+    driver: bridge
+
