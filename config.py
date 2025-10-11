@@ -3,7 +3,7 @@ from typing import List
 
 
 class Settings(BaseSettings):
-    anthropic_api_key: str
+    openai_api_key: str
     telegram_api_base_url: str = "http://localhost:8000"
     telegram_api_key: str = ""
     log_level: str = "INFO"

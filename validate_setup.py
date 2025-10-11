@@ -19,7 +19,7 @@ def check_env_file():
     with open(".env", "r") as f:
         content = f.read()
         
-        required = ["ANTHROPIC_API_KEY", "TELEGRAM_API_BASE_URL"]
+        required = ["OPENAI_API_KEY", "TELEGRAM_API_BASE_URL"]
         missing = []
         
         for var in required:
@@ -31,7 +31,7 @@ def check_env_file():
             return False
         
         # Check if keys are filled in
-        if "sk-ant-xxx" in content or "your-key-here" in content:
+        if "sk-proj-xxx" in content or "your-key-here" in content:
             print("   ⚠️  .env contains placeholder values - please update with real API keys")
             return False
     
@@ -46,7 +46,7 @@ def check_dependencies():
     required_packages = [
         "fastapi",
         "uvicorn", 
-        "anthropic",
+        "openai",
         "httpx",
         "pydantic",
         "pydantic_settings"

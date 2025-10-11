@@ -29,8 +29,8 @@
 │  LLM Agent (llm_agent.py) │   │ Telegram API Client    │
 │                           │   │ (telegram_client.py)   │
 │  ┌────────────────────┐   │   │                        │
-│  │ Claude Sonnet 3.5  │   │   │  ┌─────────────────┐   │
-│  │ (Anthropic API)    │   │   │  │ join_chat()     │   │
+│  │ GPT-4o-mini        │   │   │  ┌─────────────────┐   │
+│  │ (OpenAI API)       │   │   │  │ join_chat()     │   │
 │  └─────────┬──────────┘   │   │  ├─────────────────┤   │
 │            │              │   │  │ send_message()  │   │
 │            ▼              │   │  ├─────────────────┤   │
@@ -102,7 +102,7 @@
 ### 2. LLM Agent (`llm_agent.py`)
 
 **Responsibilities:**
-- Generate action plans via Claude
+- Generate action plans via GPT-4o-mini
 - Validate LLM output
 - Provide fallback strategies
 - Ensure diversity
@@ -110,7 +110,7 @@
 **Key Functions:**
 ```python
 generate_action_plan(session_id) -> List[Action]
-- Calls Claude API
+- Calls OpenAI API
 - Parses JSON response
 - Validates actions
 - Returns plan or fallback
@@ -130,6 +130,7 @@ _get_fallback_actions() -> List[Action]
 - Requests 3-7 actions
 - Encourages diversity
 - High temperature (1.0) for variety
+- Uses GPT-4o-mini for cost-effectiveness
 
 ### 3. Telegram API Client (`telegram_client.py`)
 
@@ -225,7 +226,7 @@ ACTION_DELAYS:
    
 3. LLM Generation
    - Build prompt with channels
-   - Call Claude API
+   - Call OpenAI API
    - Parse JSON response
    
 4. Validation
@@ -396,7 +397,7 @@ await asyncio.gather(*[
        │                 │
        ▼                 ▼
 ┌─────────────┐   ┌──────────────┐
-│ Claude API  │   │ Telegram API │
+│ OpenAI API  │   │ Telegram API │
 │ (API key)   │   │ (API key)    │
 └─────────────┘   └──────────────┘
 ```

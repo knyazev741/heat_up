@@ -11,7 +11,7 @@ services:
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TELEGRAM_API_BASE_URL=${TELEGRAM_API_BASE_URL}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     restart: unless-stopped
     volumes:
       - ./logs:/app/logs

@@ -1,7 +1,7 @@
 import json
 import logging
 from typing import List, Dict, Any
-from anthropic import Anthropic
+from openai import OpenAI
 from config import settings, CHANNEL_POOL
 
 logger = logging.getLogger(__name__)
@@ -11,8 +11,8 @@ class ActionPlannerAgent:
     """LLM-powered agent that generates natural user behavior sequences"""
     
     def __init__(self):
-        self.client = Anthropic(api_key=settings.anthropic_api_key)
-        self.model = "claude-3-5-sonnet-20241022"
+        self.client = OpenAI(api_key=settings.openai_api_key)
+        self.model = "gpt-4o-mini"
         
     def _build_prompt(self) -> str:
         """Build the system prompt for action generation"""
@@ -67,12 +67,15 @@ Generate a unique, natural sequence each time. Be creative but realistic!"""
         logger.info(f"Generating action plan for session {session_id}")
         
         try:
-            message = self.client.messages.create(
+            response = self.client.chat.completions.create(
                 model=self.model,
                 max_tokens=2048,
                 temperature=1.0,  # High temperature for diversity
-                system=self._build_prompt(),
                 messages=[
+                    {
+                        "role": "system",
+                        "content": self._build_prompt()
+                    },
                     {
                         "role": "user",
                         "content": f"Generate a natural action sequence for a new Telegram user (session: {session_id[:8]}...). Make it unique and realistic!"
@@ -81,7 +84,7 @@ Generate a unique, natural sequence each time. Be creative but realistic!"""
             )
             
             # Extract JSON from response
-            response_text = message.content[0].text
+            response_text = response.choices[0].message.content
             logger.debug(f"LLM response: {response_text}")
             
             # Parse JSON (handle potential markdown code blocks)

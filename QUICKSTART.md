@@ -11,7 +11,7 @@ cd /Users/knyaz/heat_up
 cp .env.example .env
 
 # Отредактировать .env и добавить:
-# ANTHROPIC_API_KEY=sk-ant-ваш-реальный-ключ
+# OPENAI_API_KEY=sk-proj-ваш-реальный-ключ
 # TELEGRAM_API_BASE_URL=http://ваш-telegram-api:8000
 nano .env  # или любой другой редактор
 ```
@@ -152,7 +152,7 @@ pip install -r requirements.txt
 ```
 
 ### Проблема: ".env file contains placeholder values"
-Отредактируйте `.env` и замените `sk-ant-xxx` на реальный ключ
+Отредактируйте `.env` и замените `sk-proj-xxx` на реальный ключ OpenAI
 
 ### Проблема: "Service unavailable"
 Проверьте:
@@ -160,7 +160,7 @@ pip install -r requirements.txt
 2. Порт свободен: `lsof -i :8080`
 3. Логи: смотрите вывод `python main.py`
 
-### Проблема: "Anthropic API error"
+### Проблема: "OpenAI API error"
 - Проверьте баланс API ключа
 - Проверьте интернет-соединение
 - Проверьте правильность ключа в `.env`
