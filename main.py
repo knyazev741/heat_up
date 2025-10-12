@@ -112,7 +112,7 @@ async def warmup_session(
     Returns:
         WarmupResponse with action plan and execution details
     """
-    if not session_id or len(session_id) < 8:
+    if not session_id:
         raise HTTPException(status_code=400, detail="Invalid session_id")
     
     logger.info(f"Received warmup request for session: {session_id}")
@@ -173,7 +173,7 @@ async def warmup_session_sync(
     Returns:
         WarmupResponse with full execution summary
     """
-    if not session_id or len(session_id) < 8:
+    if not session_id:
         raise HTTPException(status_code=400, detail="Invalid session_id")
     
     logger.info(f"Received sync warmup request for session: {session_id}")

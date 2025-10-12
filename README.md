@@ -145,7 +145,23 @@ curl -X POST "http://localhost:8080/warmup-sync/abc123xyz789"
 curl http://localhost:8080/health
 ```
 
-## 🔧 Конфигурация
+## 🔧 Технические детали
+
+### Telegram API интеграция
+
+Проект использует **pylogram 0.12.3** (Layer 201) для корректного взаимодействия с Telegram API через RPC вызовы. Все TL (Type Language) запросы формируются через `repr()` строки pylogram объектов, что обеспечивает совместимость с сервером.
+
+Пример invoke запроса:
+```json
+{
+  "method": "invoke",
+  "params": {
+    "query": "pylogram.raw.functions.messages.GetDialogs(offset_date=0, offset_id=0, offset_peer=pylogram.raw.types.InputPeerEmpty(), limit=20, hash=0)",
+    "retries": 10,
+    "timeout": 15
+  }
+}
+```
 
 ### Каналы (`config.py`)
 

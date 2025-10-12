@@ -2,6 +2,10 @@ import httpx
 import logging
 from typing import Dict, Any, Optional
 from config import settings
+from telegram_tl_helpers import (
+    make_get_dialogs_query,
+    make_resolve_username_query,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -179,17 +183,18 @@ class TelegramAPIClient:
             logger.error(f"Error setting idle: {str(e)}")
             return {"error": str(e)}
     
-    async def get_dialogs(self, session_id: str) -> Dict[str, Any]:
+    async def get_dialogs(self, session_id: str, limit: int = 20) -> Dict[str, Any]:
         """
         Get user's dialogs (chats/channels) - simulates browsing
         
         Args:
             session_id: Telegram session UID
+            limit: Number of dialogs to fetch
             
         Returns:
             API response
         """
-        # Using raw invoke to get dialogs
-        query = '{"_": "messages.getDialogs", "offset_date": 0, "offset_id": 0, "offset_peer": {"_": "inputPeerEmpty"}, "limit": 20, "hash": 0}'
+        # Create proper TL query using pylogram
+        query = make_get_dialogs_query(limit=limit)
         return await self.invoke_raw(session_id, query)
 
