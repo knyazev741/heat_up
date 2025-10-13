@@ -1,9 +1,11 @@
 import asyncio
 import logging
 import random
+import json
 from typing import List, Dict, Any
 from telegram_client import TelegramAPIClient
 from config import ACTION_DELAYS
+from database import save_session_action
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +44,13 @@ class ActionExecutor:
             
             try:
                 result = await self._execute_single_action(session_id, action)
+                success = not result.get("error")
+                
                 results.append({
                     "step": idx,
                     "action": action,
                     "result": result,
-                    "success": not result.get("error")
+                    "success": success
                 })
                 
                 if result.get("error"):
@@ -56,6 +60,16 @@ class ActionExecutor:
                         "error": result["error"]
                     })
                     logger.warning(f"Action failed: {result['error']}")
+                else:
+                    # Save successful action to database
+                    try:
+                        save_session_action(
+                            session_id=session_id,
+                            action_type=action_type,
+                            action_data=json.dumps(action)
+                        )
+                    except Exception as db_error:
+                        logger.error(f"Failed to save action to database: {db_error}")
                 
             except Exception as e:
                 logger.error(f"Unexpected error executing action {action_type}: {str(e)}")

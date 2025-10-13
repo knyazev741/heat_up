@@ -1,8 +1,10 @@
 import json
 import logging
 from typing import List, Dict, Any
+from datetime import datetime
 from openai import OpenAI
 from config import settings, CHANNEL_POOL
+from database import get_session_summary
 
 logger = logging.getLogger(__name__)
 
@@ -14,17 +16,65 @@ class ActionPlannerAgent:
         self.client = OpenAI(api_key=settings.openai_api_key)
         self.model = "gpt-4o-mini"
         
-    def _build_prompt(self) -> str:
-        """Build the system prompt for action generation"""
+    def _build_prompt(self, session_id: str) -> str:
+        """
+        Build the system prompt for action generation based on session history
+        
+        Args:
+            session_id: Telegram session UID
+            
+        Returns:
+            System prompt string
+        """
         
         channels_list = "\n".join([
             f"- {ch['username']}: {ch['description']}" 
             for ch in CHANNEL_POOL
         ])
         
-        return f"""You are simulating natural behavior for a new Telegram user who just logged in for the first time.
+        # Get session history summary
+        summary = get_session_summary(session_id, days=settings.session_history_days)
+        
+        if summary["is_new"]:
+            # New user prompt
+            user_context = "You are simulating natural behavior for a new Telegram user who just logged in for the first time."
+            behavior_note = "This is your first time using Telegram, so explore channels that interest you naturally."
+        else:
+            # Returning user prompt
+            last_activity = summary.get("last_activity")
+            if last_activity:
+                try:
+                    last_time = datetime.fromisoformat(last_activity)
+                    time_diff = datetime.utcnow() - last_time
+                    if time_diff.days > 0:
+                        time_ago = f"{time_diff.days} day{'s' if time_diff.days > 1 else ''} ago"
+                    elif time_diff.seconds > 3600:
+                        hours = time_diff.seconds // 3600
+                        time_ago = f"{hours} hour{'s' if hours > 1 else ''} ago"
+                    else:
+                        minutes = time_diff.seconds // 60
+                        time_ago = f"{minutes} minute{'s' if minutes > 1 else ''} ago"
+                except:
+                    time_ago = "recently"
+            else:
+                time_ago = "some time ago"
+            
+            joined_channels_str = ", ".join(summary["joined_channels"][:10]) if summary["joined_channels"] else "none"
+            
+            user_context = f"""You are simulating a returning Telegram user who is coming back online.
 
-Your task is to generate a realistic sequence of 3-7 actions that this new user would perform. Be diverse and natural.
+Previous activity summary:
+- Last active: {time_ago}
+- Total previous actions: {summary['total_actions']}
+- Previously joined channels: {joined_channels_str}
+
+You're back for another session and should continue natural, varied behavior."""
+            
+            behavior_note = "As a returning user, you can explore new channels, revisit ones you've joined, or just browse. Be natural and diverse."
+        
+        return f"""{user_context}
+
+Your task is to generate a realistic sequence of 3-7 actions. Be diverse and natural.
 
 Available channels to choose from:
 {channels_list}
@@ -35,6 +85,7 @@ Available action types:
 3. "idle" - Take a break, simulate being idle (requires: duration_seconds)
 
 Important guidelines:
+- {behavior_note}
 - Choose 2-4 channels to join based on varied interests
 - After joining a channel, often read messages there
 - Include idle periods to simulate natural pauses
@@ -56,7 +107,7 @@ Generate a unique, natural sequence each time. Be creative but realistic!"""
 
     async def generate_action_plan(self, session_id: str) -> List[Dict[str, Any]]:
         """
-        Generate a natural sequence of actions for a new user
+        Generate a natural sequence of actions based on session history
         
         Args:
             session_id: The Telegram session ID (for logging/context)
@@ -74,11 +125,11 @@ Generate a unique, natural sequence each time. Be creative but realistic!"""
                 messages=[
                     {
                         "role": "system",
-                        "content": self._build_prompt()
+                        "content": self._build_prompt(session_id)
                     },
                     {
                         "role": "user",
-                        "content": f"Generate a natural action sequence for a new Telegram user (session: {session_id[:8]}...). Make it unique and realistic!"
+                        "content": f"Generate a natural action sequence for this Telegram user (session: {session_id[:8]}...). Make it unique and realistic!"
                     }
                 ]
             )

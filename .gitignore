@@ -52,3 +52,11 @@ htmlcov/
 # Jupyter
 .ipynb_checkpoints
 
+# Database
+sessions.db
+*.db
+
+# Temporary files
+response_*.json
+test_integration.py
+

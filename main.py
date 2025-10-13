@@ -1,15 +1,17 @@
 import logging
 import sys
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from config import settings
 from telegram_client import TelegramAPIClient
 from llm_agent import ActionPlannerAgent
 from executor import ActionExecutor
+from database import init_database, get_session_history, cleanup_old_history, get_session_summary
 
 # Configure logging
 logging.basicConfig(
@@ -28,6 +30,17 @@ telegram_client: Optional[TelegramAPIClient] = None
 llm_agent: Optional[ActionPlannerAgent] = None
 
 
+async def cleanup_task():
+    """Background task to cleanup old session history daily"""
+    while True:
+        try:
+            await asyncio.sleep(86400)  # Run every 24 hours
+            logger.info("Running session history cleanup...")
+            cleanup_old_history(days=settings.session_history_days)
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for the application"""
@@ -35,14 +48,24 @@ async def lifespan(app: FastAPI):
     
     # Startup
     logger.info("Starting Heat Up service...")
+    
+    # Initialize database
+    init_database()
+    
+    # Initialize clients
     telegram_client = TelegramAPIClient()
     llm_agent = ActionPlannerAgent()
+    
+    # Start background cleanup task
+    cleanup_task_handle = asyncio.create_task(cleanup_task())
+    
     logger.info("Service ready")
     
     yield
     
     # Shutdown
     logger.info("Shutting down service...")
+    cleanup_task_handle.cancel()
     if telegram_client:
         await telegram_client.close()
     logger.info("Service stopped")
@@ -208,6 +231,32 @@ async def warmup_session_sync(
     except Exception as e:
         logger.error(f"Error during sync warmup: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Warmup failed: {str(e)}")
+
+
+@app.get("/sessions/{session_id}/history")
+async def get_session_history_endpoint(session_id: str, days: int = 30):
+    """
+    Get session history for a specific session
+    
+    Args:
+        session_id: The Telegram session UID
+        days: Number of days to look back (default: 30)
+        
+    Returns:
+        Session history and summary
+    """
+    try:
+        history = get_session_history(session_id, days)
+        summary = get_session_summary(session_id, days)
+        
+        return {
+            "session_id": session_id,
+            "summary": summary,
+            "history": history
+        }
+    except Exception as e:
+        logger.error(f"Error retrieving session history: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve history: {str(e)}")
 
 
 async def execute_warmup_background(

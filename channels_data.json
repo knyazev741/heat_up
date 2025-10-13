@@ -1,0 +1,213 @@
+[
+  {
+    "username": "@rt_russian",
+    "description": "RT на русском",
+    "category": "News",
+    "subscribers": 1500000,
+    "tgstat_url": "https://t.me/rt_russian"
+  },
+  {
+    "username": "@bbcrussian",
+    "description": "BBC News Русская служба",
+    "category": "News",
+    "subscribers": 800000,
+    "tgstat_url": "https://t.me/bbcrussian"
+  },
+  {
+    "username": "@rianru",
+    "description": "РИА Новости",
+    "category": "News",
+    "subscribers": 1200000,
+    "tgstat_url": "https://t.me/rianru"
+  },
+  {
+    "username": "@tass_agency",
+    "description": "ТАСС",
+    "category": "News",
+    "subscribers": 900000,
+    "tgstat_url": "https://t.me/tass_agency"
+  },
+  {
+    "username": "@meduzalive",
+    "description": "Медуза — LIVE",
+    "category": "News",
+    "subscribers": 700000,
+    "tgstat_url": "https://t.me/meduzalive"
+  },
+  {
+    "username": "@tecnoblog",
+    "description": "Технологии и интернет",
+    "category": "Technology",
+    "subscribers": 500000,
+    "tgstat_url": "https://t.me/tecnoblog"
+  },
+  {
+    "username": "@ithumor",
+    "description": "IT юмор и мемы",
+    "category": "Technology",
+    "subscribers": 400000,
+    "tgstat_url": "https://t.me/ithumor"
+  },
+  {
+    "username": "@habr_com",
+    "description": "Хабр",
+    "category": "Technology",
+    "subscribers": 600000,
+    "tgstat_url": "https://t.me/habr_com"
+  },
+  {
+    "username": "@pythonworld",
+    "description": "Python World",
+    "category": "Programming",
+    "subscribers": 350000,
+    "tgstat_url": "https://t.me/pythonworld"
+  },
+  {
+    "username": "@proglib",
+    "description": "Библиотека программиста",
+    "category": "Programming",
+    "subscribers": 450000,
+    "tgstat_url": "https://t.me/proglib"
+  },
+  {
+    "username": "@devops_jobs",
+    "description": "DevOps Jobs",
+    "category": "Programming",
+    "subscribers": 200000,
+    "tgstat_url": "https://t.me/devops_jobs"
+  },
+  {
+    "username": "@crypto",
+    "description": "Крипто новости",
+    "category": "Crypto",
+    "subscribers": 550000,
+    "tgstat_url": "https://t.me/crypto"
+  },
+  {
+    "username": "@bitcoin",
+    "description": "Bitcoin News",
+    "category": "Crypto",
+    "subscribers": 800000,
+    "tgstat_url": "https://t.me/bitcoin"
+  },
+  {
+    "username": "@cryptonews",
+    "description": "CryptoNews",
+    "category": "Crypto",
+    "subscribers": 600000,
+    "tgstat_url": "https://t.me/cryptonews"
+  },
+  {
+    "username": "@forbes_ru",
+    "description": "Forbes Россия",
+    "category": "Business",
+    "subscribers": 450000,
+    "tgstat_url": "https://t.me/forbes_ru"
+  },
+  {
+    "username": "@businessinsider",
+    "description": "Business Insider",
+    "category": "Business",
+    "subscribers": 300000,
+    "tgstat_url": "https://t.me/businessinsider"
+  },
+  {
+    "username": "@rb_ru",
+    "description": "РБК",
+    "category": "Business",
+    "subscribers": 800000,
+    "tgstat_url": "https://t.me/rb_ru"
+  },
+  {
+    "username": "@sciencepop",
+    "description": "Популярная наука",
+    "category": "Science",
+    "subscribers": 400000,
+    "tgstat_url": "https://t.me/sciencepop"
+  },
+  {
+    "username": "@nplus1",
+    "description": "N+1",
+    "category": "Science",
+    "subscribers": 350000,
+    "tgstat_url": "https://t.me/nplus1"
+  },
+  {
+    "username": "@nasa",
+    "description": "NASA",
+    "category": "Science",
+    "subscribers": 900000,
+    "tgstat_url": "https://t.me/nasa"
+  },
+  {
+    "username": "@kinopoisk",
+    "description": "КиноПоиск",
+    "category": "Entertainment",
+    "subscribers": 700000,
+    "tgstat_url": "https://t.me/kinopoisk"
+  },
+  {
+    "username": "@filmpro",
+    "description": "Про кино",
+    "category": "Entertainment",
+    "subscribers": 300000,
+    "tgstat_url": "https://t.me/filmpro"
+  },
+  {
+    "username": "@muzofon_bot",
+    "description": "Музыка",
+    "category": "Music",
+    "subscribers": 500000,
+    "tgstat_url": "https://t.me/muzofon_bot"
+  },
+  {
+    "username": "@sports_ru",
+    "description": "Sports.ru",
+    "category": "Sports",
+    "subscribers": 600000,
+    "tgstat_url": "https://t.me/sports_ru"
+  },
+  {
+    "username": "@championat",
+    "description": "Чемпионат",
+    "category": "Sports",
+    "subscribers": 500000,
+    "tgstat_url": "https://t.me/championat"
+  },
+  {
+    "username": "@fitness_live",
+    "description": "Фитнес и здоровье",
+    "category": "Lifestyle",
+    "subscribers": 250000,
+    "tgstat_url": "https://t.me/fitness_live"
+  },
+  {
+    "username": "@travel_russia",
+    "description": "Путешествия по России",
+    "category": "Lifestyle",
+    "subscribers": 300000,
+    "tgstat_url": "https://t.me/travel_russia"
+  },
+  {
+    "username": "@recepti",
+    "description": "Рецепты и кулинария",
+    "category": "Lifestyle",
+    "subscribers": 400000,
+    "tgstat_url": "https://t.me/recepti"
+  },
+  {
+    "username": "@adme_ru",
+    "description": "AdMe.ru",
+    "category": "Entertainment",
+    "subscribers": 850000,
+    "tgstat_url": "https://t.me/adme_ru"
+  },
+  {
+    "username": "@memes",
+    "description": "Мемы",
+    "category": "Entertainment",
+    "subscribers": 600000,
+    "tgstat_url": "https://t.me/memes"
+  }
+]
+
