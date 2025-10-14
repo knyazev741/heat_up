@@ -122,6 +122,11 @@ class ActionExecutor:
         
         action_type = action.get("action")
         
+        # Check for FloodWait before executing
+        if hasattr(self, '_in_floodwait') and self._in_floodwait:
+            logger.warning(f"Skipping {action_type} due to FloodWait cooldown")
+            return {"error": "Session in FloodWait cooldown", "skipped": True}
+        
         if action_type == "join_channel":
             return await self._join_channel(session_id, action)
         elif action_type == "read_messages":
@@ -134,6 +139,18 @@ class ActionExecutor:
             return await self._message_bot(session_id, action)
         elif action_type == "view_profile":
             return await self._view_profile(session_id, action)
+        elif action_type == "update_profile":
+            return await self._update_profile(session_id, action)
+        elif action_type == "sync_contacts":
+            return await self._sync_contacts(session_id, action)
+        elif action_type == "reply_in_chat":
+            return await self._reply_in_chat(session_id, action)
+        elif action_type == "create_group":
+            return await self._create_group(session_id, action)
+        elif action_type == "forward_message":
+            return await self._forward_message(session_id, action)
+        elif action_type == "update_privacy":
+            return await self._update_privacy(session_id, action)
         else:
             return {"error": f"Unknown action type: {action_type}"}
     
@@ -320,6 +337,151 @@ class ActionExecutor:
             "duration": duration,
             "status": "completed"
         }
+    
+    async def _update_profile(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Update profile information"""
+        first_name = action.get("first_name")
+        last_name = action.get("last_name")
+        bio = action.get("bio")
+        
+        logger.info(f"Updating profile: {first_name} {last_name}")
+        
+        # For now, return success - actual implementation would use TL methods
+        # This would require raw TL invoke for UpdateProfile
+        result = {
+            "action": "update_profile",
+            "status": "completed",
+            "first_name": first_name,
+            "last_name": last_name,
+            "bio": bio
+        }
+        
+        # Simulate time spent updating profile
+        await asyncio.sleep(random.uniform(3, 7))
+        
+        logger.info("Profile update completed (simulated)")
+        return result
+    
+    async def _sync_contacts(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Synchronize contacts"""
+        logger.info("Syncing contacts")
+        
+        # Simulate contact sync - in real implementation would use sync_contacts RPC
+        await asyncio.sleep(random.uniform(2, 5))
+        
+        return {
+            "action": "sync_contacts",
+            "status": "completed",
+            "synced_contacts": 0  # Placeholder
+        }
+    
+    async def _reply_in_chat(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Reply to a message in a chat"""
+        chat_username = action.get("chat_username")
+        reply_text = action.get("reply_text", "")
+        
+        if not chat_username:
+            return {"error": "Missing chat_username"}
+        
+        if not reply_text:
+            reply_text = "Interesting! Thanks for sharing."
+        
+        logger.info(f"Replying in {chat_username}: {reply_text[:50]}...")
+        
+        # Check for FloodWait keywords in reply
+        if self._check_floodwait_keywords(reply_text):
+            return {"error": "Reply text contains potential spam keywords"}
+        
+        try:
+            # Send the message
+            result = await self.telegram_client.send_message(
+                session_id,
+                chat_username,
+                reply_text,
+                disable_notification=True
+            )
+            
+            # Check for FloodWait error
+            if result.get("error"):
+                error_text = str(result.get("error", "")).lower()
+                if "flood" in error_text or "wait" in error_text:
+                    logger.error(f"⚠️ FLOODWAIT DETECTED for session {session_id}")
+                    self._in_floodwait = True
+                    from database import update_account
+                    from database import get_account
+                    account = get_account(session_id)
+                    if account:
+                        update_account(session_id, is_frozen=True)
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error replying in chat: {e}")
+            return {"error": str(e)}
+    
+    async def _create_group(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a group"""
+        group_name = action.get("group_name", "My Group")
+        
+        logger.info(f"Creating group: {group_name}")
+        
+        # For now, simulated - would use create_group RPC in real implementation
+        await asyncio.sleep(random.uniform(3, 6))
+        
+        return {
+            "action": "create_group",
+            "group_name": group_name,
+            "status": "completed"
+        }
+    
+    async def _forward_message(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Forward a message"""
+        from_chat = action.get("from_chat")
+        to_chat = action.get("to_chat")
+        
+        if not from_chat or not to_chat:
+            return {"error": "Missing from_chat or to_chat"}
+        
+        logger.info(f"Forwarding message from {from_chat} to {to_chat}")
+        
+        # For now, simulated - would use ForwardMessages TL method
+        await asyncio.sleep(random.uniform(2, 4))
+        
+        return {
+            "action": "forward_message",
+            "from_chat": from_chat,
+            "to_chat": to_chat,
+            "status": "completed"
+        }
+    
+    async def _update_privacy(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Update privacy settings"""
+        logger.info("Updating privacy settings")
+        
+        # Recommended privacy settings for warmup
+        privacy_settings = {
+            "phone_number": "contacts",  # Only contacts can see phone
+            "profile_photo": "everyone",  # Everyone can see photo (green flag!)
+            "forwards": "everyone",  # Allow forwards
+            "calls": "contacts"  # Only contacts can call
+        }
+        
+        # Simulate setting privacy
+        await asyncio.sleep(random.uniform(3, 6))
+        
+        return {
+            "action": "update_privacy",
+            "settings": privacy_settings,
+            "status": "completed"
+        }
+    
+    def _check_floodwait_keywords(self, text: str) -> bool:
+        """Check if text contains potential spam keywords"""
+        spam_keywords = [
+            "buy now", "click here", "limited offer", "act now",
+            "free money", "earn $", "make money fast"
+        ]
+        text_lower = text.lower()
+        return any(keyword in text_lower for keyword in spam_keywords)
     
     def _get_natural_delay(self) -> float:
         """Get a randomized natural delay between actions"""

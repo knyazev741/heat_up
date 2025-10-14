@@ -3,8 +3,8 @@ import logging
 from typing import List, Dict, Any
 from datetime import datetime
 from openai import OpenAI
-from config import settings, CHANNEL_POOL, BOTS_POOL
-from database import get_session_summary
+from config import settings, CHANNEL_POOL, BOTS_POOL, WARMUP_GUIDELINES, RED_FLAGS, GREEN_FLAGS
+from database import get_session_summary, get_account, get_persona, get_relevant_chats
 
 logger = logging.getLogger(__name__)
 
@@ -16,135 +16,202 @@ class ActionPlannerAgent:
         self.client = OpenAI(api_key=settings.openai_api_key)
         self.model = "gpt-4o-mini"
         
-    def _build_prompt(self, session_id: str) -> str:
+    def _build_prompt(self, session_id: str, account_data: Dict[str, Any] = None, persona_data: Dict[str, Any] = None) -> str:
         """
-        Build the system prompt for action generation based on session history
+        Build the system prompt for action generation based on session history, persona, and warmup stage
         
         Args:
             session_id: Telegram session UID
+            account_data: Account information from database
+            persona_data: Persona information from database
             
         Returns:
             System prompt string
         """
         
-        channels_list = "\n".join([
-            f"- {ch['username']}: {ch['description']}" 
-            for ch in CHANNEL_POOL
-        ])
+        # Get account and persona if not provided
+        if not account_data:
+            account_data = get_account(session_id) or {}
+        
+        warmup_stage = account_data.get("warmup_stage", 1)
+        account_id = account_data.get("id")
+        
+        if not persona_data and account_id:
+            persona_data = get_persona(account_id)
+        
+        # Get warmup guidelines for current stage
+        guidelines = WARMUP_GUIDELINES.get(warmup_stage, WARMUP_GUIDELINES[1])
+        
+        # Get relevant chats for this persona
+        relevant_chats = []
+        if account_id:
+            relevant_chats = get_relevant_chats(account_id, limit=15)
+        
+        # Build channels list (mix of relevant and general)
+        if relevant_chats:
+            channels_list = "\n".join([
+                f"- {ch['chat_username']}: {ch.get('chat_title', 'Unknown')} "
+                f"(relevance: {ch.get('relevance_score', 0):.1f}) - {ch.get('relevance_reason', '')[:50]}" 
+                for ch in relevant_chats[:10]
+            ])
+        else:
+            channels_list = "\n".join([
+                f"- {ch['username']}: {ch['description']}" 
+                for ch in CHANNEL_POOL[:10]
+            ])
         
         bots_list = "\n".join([
             f"- {bot['username']}: {bot['description']}" 
-            for bot in BOTS_POOL
+            for bot in BOTS_POOL[:5]
         ]) if BOTS_POOL else "No bots available"
         
-        # Get session history summary
-        summary = get_session_summary(session_id, days=settings.session_history_days)
-        
-        if summary["is_new"]:
-            # New user prompt
-            user_context = "You are simulating natural behavior for a new Telegram user who just logged in for the first time."
-            behavior_note = "This is your first time using Telegram, so explore channels that interest you naturally."
+        # Build persona context
+        if persona_data:
+            persona_context = f"""
+ТЫ - это реальный пользователь Telegram со следующей личностью:
+
+Имя: {persona_data.get('generated_name')}
+Возраст: {persona_data.get('age')} лет
+Профессия: {persona_data.get('occupation')}
+Город: {persona_data.get('city')}, {persona_data.get('country')}
+Интересы: {', '.join(persona_data.get('interests', []))}
+Характер: {', '.join(persona_data.get('personality_traits', []))}
+Стиль общения: {persona_data.get('communication_style')}
+Уровень активности: {persona_data.get('activity_level')}
+
+О тебе:
+{persona_data.get('full_description', '')}
+
+История:
+{persona_data.get('background_story', '')}
+
+ВАЖНО: Ты должен вести себя в соответствии со своей личностью. Твои действия должны отражать твои интересы, стиль общения и уровень активности.
+"""
         else:
-            # Returning user prompt
-            last_activity = summary.get("last_activity")
-            if last_activity:
-                try:
-                    last_time = datetime.fromisoformat(last_activity)
-                    time_diff = datetime.utcnow() - last_time
-                    if time_diff.days > 0:
-                        time_ago = f"{time_diff.days} day{'s' if time_diff.days > 1 else ''} ago"
-                    elif time_diff.seconds > 3600:
-                        hours = time_diff.seconds // 3600
-                        time_ago = f"{hours} hour{'s' if hours > 1 else ''} ago"
-                    else:
-                        minutes = time_diff.seconds // 60
-                        time_ago = f"{minutes} minute{'s' if minutes > 1 else ''} ago"
-                except:
-                    time_ago = "recently"
-            else:
-                time_ago = "some time ago"
-            
-            joined_channels_str = ", ".join(summary["joined_channels"][:10]) if summary["joined_channels"] else "none"
-            
-            user_context = f"""You are simulating a returning Telegram user who is coming back online.
-
-Previous activity summary:
-- Last active: {time_ago}
-- Total previous actions: {summary['total_actions']}
-- Previously joined channels: {joined_channels_str}
-
-You're back for another session and should continue natural, varied behavior."""
-            
-            behavior_note = "As a returning user, you can explore new channels, revisit ones you've joined, or just browse. Be natural and diverse."
+            persona_context = "Ты - обычный пользователь Telegram, который только начинает использовать мессенджер."
         
-        return f"""{user_context}
+        # Build stage-specific guidance
+        stage_guidance = f"""
+📅 ТЕКУЩАЯ СТАДИЯ ПРОГРЕВА: День {warmup_stage} - {guidelines['description']}
 
-Your task is to generate a realistic sequence of 5-12 actions that simulate natural human behavior on Telegram.
-BE CREATIVE and DIVERSE - each user should behave uniquely! Don't follow predictable patterns.
+ЛИМИТЫ ДЛЯ ЭТОЙ СТАДИИ:
+- Максимум действий: {guidelines['max_actions']}
+- Максимум вступлений в новые чаты: {guidelines['max_joins']}
+- Максимум отправленных сообщений: {guidelines['max_messages']}
+- Разрешенные типы действий: {', '.join(guidelines['allowed_actions'])}
 
-Available channels to interact with:
+РЕКОМЕНДАЦИИ:
+{chr(10).join(['- ' + rec for rec in guidelines['recommendations']])}
+"""
+        
+        # Build red/green flags
+        flags_guidance = f"""
+🚫 КРАСНЫЕ ФЛАГИ (ИЗБЕГАТЬ):
+{chr(10).join(['- ' + flag for flag in RED_FLAGS[:5]])}
+
+✅ ЗЕЛЕНЫЕ ФЛАГИ (ПРИОРИТЕТ):
+{chr(10).join(['- ' + flag for flag in GREEN_FLAGS[:5]])}
+"""
+        
+        return f"""{persona_context}
+
+{stage_guidance}
+
+{flags_guidance}
+
+Твоя задача - сгенерировать реалистичную последовательность действий, которые ты бы совершил в Telegram СЕГОДНЯ.
+
+Доступные каналы/чаты для взаимодействия:
 {channels_list}
 
-Available bots to try:
+Доступные боты:
 {bots_list}
 
-Available action types (use variety!):
+ДОСТУПНЫЕ ТИПЫ ДЕЙСТВИЙ (выбирай только из разрешенных для текущей стадии!):
 
-BASIC ACTIONS:
-1. "join_channel" - Join a channel
+БАЗОВЫЕ ДЕЙСТВИЯ:
+1. "update_profile" - Обновить профиль (имя, фото, био)
+   - Params: first_name, last_name, bio
+   - Только для стадий 1-3!
+
+2. "join_channel" - Вступить в канал/группу
    - Params: channel_username
    
-2. "read_messages" - Browse and read messages in a channel
+3. "read_messages" - Читать сообщения в канале
    - Params: channel_username, duration_seconds (3-20)
    
-3. "idle" - Take a natural pause/break
+4. "idle" - Пауза/перерыв
    - Params: duration_seconds (2-10)
 
-ENGAGEMENT ACTIONS:
-4. "react_to_message" - React to a message with emoji (shows you're engaged!)
-   - Params: channel_username
-   - Note: System will automatically pick an emoji that's already used in the channel (safe and natural)
-   
-5. "message_bot" - Send a message to a bot (explore bot features)
-   - Params: bot_username, message (e.g., "/start", "/help", "hello")
-   
-6. "view_profile" - View a channel's profile/info
+5. "view_profile" - Посмотреть профиль канала
    - Params: channel_username, duration_seconds (3-8)
 
-IMPORTANT - BE NATURAL AND DIVERSE:
-- {behavior_note}
-- DON'T always join → read → idle in a loop! Mix it up!
-- React to interesting posts (10-30% of reads should have reactions)
-- Try messaging 1-2 bots per session (explore features)
-- Sometimes view profiles before joining
-- Include realistic pauses between different activities
-- Show personality - some users are more active, some more passive
-- Total actions: 5-12 (more experienced users do more)
+ПРОДВИНУТЫЕ ДЕЙСТВИЯ (доступны с определенных стадий):
+6. "react_to_message" - Поставить реакцию на сообщение
+   - Params: channel_username
+   - Доступно со стадии 5+
+   
+7. "message_bot" - Написать боту
+   - Params: bot_username, message (например "/start", "/help")
+   - Доступно со стадии 5+
+   
+8. "reply_in_chat" - Ответить на сообщение в группе
+   - Params: chat_username, reply_text
+   - Доступно со стадии 8+
+   - LLM сгенерирует естественный ответ
+   
+9. "sync_contacts" - Синхронизировать контакты
+   - Доступно со стадии 4+
+   
+10. "update_privacy" - Настроить приватность
+   - Доступно со стадии 3+
+   
+11. "create_group" - Создать группу
+   - Params: group_name
+   - Доступно со стадии 10+
+   
+12. "forward_message" - Переслать сообщение
+   - Params: from_chat, to_chat
+   - Доступно со стадии 12+
 
-Example of DIVERSE behavior:
+КРИТИЧЕСКИ ВАЖНО:
+- СТРОГО соблюдай лимиты текущей стадии!
+- Используй ТОЛЬКО разрешенные типы действий
+- Веди себя естественно, как реальный человек с твоей личностью
+- Действуй в соответствии со своими интересами
+- НЕ создавай шаблонные последовательности
+- Включай паузы (idle) между действиями
+- Количество действий: от {max(3, guidelines['max_actions'] - 5)} до {guidelines['max_actions']}
+
+Пример для СТАДИИ 1 (только профиль):
 [
-  {{"action": "view_profile", "channel_username": "@telegram", "duration_seconds": 5, "reason": "Checking out the official channel"}},
-  {{"action": "join_channel", "channel_username": "@telegram", "reason": "Looks interesting, joining"}},
-  {{"action": "read_messages", "channel_username": "@telegram", "duration_seconds": 10, "reason": "Reading latest updates"}},
-  {{"action": "react_to_message", "channel_username": "@telegram", "reason": "Liked the update about new features"}},
-  {{"action": "idle", "duration_seconds": 4, "reason": "Quick break"}},
-  {{"action": "message_bot", "bot_username": "@wiki", "message": "/start", "reason": "Curious about Wikipedia bot"}},
-  {{"action": "idle", "duration_seconds": 6, "reason": "Reading bot response"}},
-  {{"action": "join_channel", "channel_username": "@crypto", "reason": "Interested in crypto news"}},
-  {{"action": "read_messages", "channel_username": "@crypto", "duration_seconds": 15, "reason": "Checking market updates"}},
-  {{"action": "react_to_message", "channel_username": "@crypto", "reason": "Exciting news about Bitcoin"}},
-  {{"action": "message_bot", "bot_username": "@gif", "message": "cats", "reason": "Looking for funny cat GIFs"}},
-  {{"action": "idle", "duration_seconds": 8, "reason": "Taking a longer break"}}
+  {{"action": "update_profile", "first_name": "{persona_data.get('generated_name', 'User').split()[0] if persona_data else 'User'}", "last_name": "{persona_data.get('generated_name', 'User').split()[-1] if persona_data else 'User'}", "bio": "Краткое описание", "reason": "Настраиваю профиль"}},
+  {{"action": "idle", "duration_seconds": 5, "reason": "Осматриваюсь"}},
+  {{"action": "idle", "duration_seconds": 8, "reason": "Изучаю интерфейс"}}
 ]
 
-Generate a UNIQUE, NATURAL sequence. Make each user's behavior different!"""
+Пример для СТАДИИ 5+ (первая активность):
+[
+  {{"action": "view_profile", "channel_username": "@telegram", "duration_seconds": 5, "reason": "Смотрю информацию о канале"}},
+  {{"action": "join_channel", "channel_username": "@telegram", "reason": "Интересный канал, вступаю"}},
+  {{"action": "read_messages", "channel_username": "@telegram", "duration_seconds": 12, "reason": "Читаю последние обновления"}},
+  {{"action": "react_to_message", "channel_username": "@telegram", "reason": "Понравился пост про новые функции"}},
+  {{"action": "idle", "duration_seconds": 6, "reason": "Небольшой перерыв"}},
+  {{"action": "message_bot", "bot_username": "@wiki", "message": "/start", "reason": "Интересно попробовать Википедия-бота"}},
+  {{"action": "idle", "duration_seconds": 4, "reason": "Читаю ответ бота"}}
+]
 
-    async def generate_action_plan(self, session_id: str) -> List[Dict[str, Any]]:
+СГЕНЕРИРУЙ УНИКАЛЬНУЮ последовательность действий для СВОЕЙ личности на текущей стадии {warmup_stage}!
+Формат ответа - ТОЛЬКО JSON массив объектов, без дополнительного текста!"""
+
+    async def generate_action_plan(self, session_id: str, account_data: Dict[str, Any] = None, persona_data: Dict[str, Any] = None) -> List[Dict[str, Any]]:
         """
-        Generate a natural sequence of actions based on session history
+        Generate a natural sequence of actions based on session history, persona, and warmup stage
         
         Args:
-            session_id: The Telegram session ID (for logging/context)
+            session_id: The Telegram session ID
+            account_data: Account information (optional, will be fetched if not provided)
+            persona_data: Persona information (optional, will be fetched if not provided)
             
         Returns:
             List of actions to perform
@@ -152,9 +219,15 @@ Generate a UNIQUE, NATURAL sequence. Make each user's behavior different!"""
         logger.info(f"Generating action plan for session {session_id}")
         
         try:
+            # Get account data if not provided
+            if not account_data:
+                account_data = get_account(session_id) or {}
+            
+            warmup_stage = account_data.get("warmup_stage", 1)
+            
             # Build prompts
-            system_prompt = self._build_prompt(session_id)
-            user_prompt = f"Generate a natural action sequence for this Telegram user (session: {session_id[:8]}...). Make it unique and realistic!"
+            system_prompt = self._build_prompt(session_id, account_data, persona_data)
+            user_prompt = f"Сгенерируй последовательность действий для стадии {warmup_stage}. Будь креативным и естественным!"
             
             # Log the full conversation being sent to LLM
             logger.info("=" * 100)
