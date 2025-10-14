@@ -39,6 +39,7 @@ env/
 
 # Logs
 *.log
+logs/
 
 # OS
 .DS_Store

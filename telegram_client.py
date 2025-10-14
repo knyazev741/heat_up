@@ -197,4 +197,94 @@ class TelegramAPIClient:
         # Create proper TL query using pylogram
         query = make_get_dialogs_query(limit=limit)
         return await self.invoke_raw(session_id, query)
+    
+    async def send_reaction(
+        self,
+        session_id: str,
+        chat_id: str,
+        message_id: int,
+        emoji: str = "👍"
+    ) -> Dict[str, Any]:
+        """
+        Send a reaction to a message
+        
+        Args:
+            session_id: Telegram session UID
+            chat_id: Chat ID or username
+            message_id: Message ID to react to
+            emoji: Emoji reaction (default: 👍)
+            
+        Returns:
+            API response
+        """
+        url = f"{self.base_url}/api/external/sessions/{session_id}/rpc/send_reaction"
+        payload = {
+            "method": "send_reaction",
+            "params": {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "emoji": emoji,
+                "big": False
+            }
+        }
+        
+        logger.info(f"Sending reaction {emoji} to message {message_id} in {chat_id}")
+        
+        try:
+            response = await self.client.post(
+                url,
+                json=payload,
+                headers=self._get_headers()
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Failed to send reaction: {e.response.text}")
+            return {"error": str(e), "status_code": e.response.status_code}
+        except Exception as e:
+            logger.error(f"Error sending reaction: {str(e)}")
+            return {"error": str(e)}
+    
+    async def get_channel_messages(
+        self,
+        session_id: str,
+        chat_id: str,
+        limit: int = 10
+    ) -> Dict[str, Any]:
+        """
+        Get messages from a channel (for reading/reacting)
+        
+        Args:
+            session_id: Telegram session UID
+            chat_id: Channel ID or username
+            limit: Number of messages to fetch
+            
+        Returns:
+            API response with messages
+        """
+        url = f"{self.base_url}/api/external/sessions/{session_id}/rpc"
+        payload = {
+            "method": "get_chat_messages",
+            "params": {
+                "chat_id": chat_id,
+                "limit": limit
+            }
+        }
+        
+        logger.info(f"Getting {limit} messages from {chat_id}")
+        
+        try:
+            response = await self.client.post(
+                url,
+                json=payload,
+                headers=self._get_headers()
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Failed to get messages: {e.response.text}")
+            return {"error": str(e), "status_code": e.response.status_code}
+        except Exception as e:
+            logger.error(f"Error getting messages: {str(e)}")
+            return {"error": str(e)}
 

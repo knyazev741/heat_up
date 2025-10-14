@@ -56,6 +56,32 @@ def load_channels_from_file(filepath: str = "channels_data.json") -> List[dict]:
         return []
 
 
+def load_bots_from_file(filepath: str = "bots_data.json") -> List[dict]:
+    """
+    Load bots from JSON file
+    
+    Args:
+        filepath: Path to bots JSON file
+        
+    Returns:
+        List of bot dictionaries
+    """
+    file_path = Path(filepath)
+    
+    if not file_path.exists():
+        logger.warning(f"Bots file not found: {filepath}. No bots available.")
+        return []
+    
+    try:
+        with file_path.open('r', encoding='utf-8') as f:
+            bots = json.load(f)
+            logger.info(f"Loaded {len(bots)} bots from {filepath}")
+            return bots
+    except Exception as e:
+        logger.error(f"Error loading bots from file: {e}")
+        return []
+
+
 def build_channel_pool() -> List[dict]:
     """
     Build the channel pool by merging verified channels with fetched channels
@@ -85,6 +111,9 @@ def build_channel_pool() -> List[dict]:
 # Pool of channels and chats for LLM to choose from
 # Merges verified channels with TGStat-fetched channels
 CHANNEL_POOL = build_channel_pool()
+
+# Pool of bots for LLM to interact with
+BOTS_POOL = load_bots_from_file()
 
 
 # Actions timing (in seconds)

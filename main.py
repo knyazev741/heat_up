@@ -14,15 +14,28 @@ from executor import ActionExecutor
 from database import init_database, get_session_history, cleanup_old_history, get_session_summary
 
 # Configure logging
+# Create logs directory if it doesn't exist
+import os
+os.makedirs("logs", exist_ok=True)
+
+# Configure root logger
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper()),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout)
+        # Console output
+        logging.StreamHandler(sys.stdout),
+        # File output with detailed logs
+        logging.FileHandler("logs/heat_up.log", mode='a', encoding='utf-8')
     ]
 )
 
 logger = logging.getLogger(__name__)
+
+logger.info("=" * 100)
+logger.info("🚀 HEAT UP SERVICE STARTING")
+logger.info(f"Log file: logs/heat_up.log")
+logger.info("=" * 100)
 
 
 # Global clients

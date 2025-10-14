@@ -1,0 +1,78 @@
+[
+  {
+    "username": "@BotFather",
+    "description": "Official bot for creating and managing bots",
+    "category": "Official"
+  },
+  {
+    "username": "@telegraph",
+    "description": "Telegraph publishing platform bot",
+    "category": "Productivity"
+  },
+  {
+    "username": "@vote",
+    "description": "Create polls and votes",
+    "category": "Productivity"
+  },
+  {
+    "username": "@gif",
+    "description": "Search and send GIFs",
+    "category": "Entertainment"
+  },
+  {
+    "username": "@pic",
+    "description": "Search and send pictures",
+    "category": "Entertainment"
+  },
+  {
+    "username": "@youtube",
+    "description": "Search YouTube videos",
+    "category": "Entertainment"
+  },
+  {
+    "username": "@wiki",
+    "description": "Search Wikipedia",
+    "category": "Information"
+  },
+  {
+    "username": "@imdb",
+    "description": "Search movies and shows",
+    "category": "Entertainment"
+  },
+  {
+    "username": "@GameBot",
+    "description": "Gaming platform bot",
+    "category": "Games"
+  },
+  {
+    "username": "@QuizBot",
+    "description": "Create and share quizzes",
+    "category": "Entertainment"
+  },
+  {
+    "username": "@sticker",
+    "description": "Find stickers",
+    "category": "Entertainment"
+  },
+  {
+    "username": "@GetGems",
+    "description": "Crypto wallet bot",
+    "category": "Crypto"
+  },
+  {
+    "username": "@DurgerKingBot",
+    "description": "Burger King bot",
+    "category": "Services"
+  },
+  {
+    "username": "@ControllerBot",
+    "description": "Bot control and analytics",
+    "category": "Productivity"
+  },
+  {
+    "username": "@PayBot",
+    "description": "Payment processing bot",
+    "category": "Services"
+  }
+]
+
