@@ -5,7 +5,7 @@ SearchAgent - REAL web search для Telegram каналов через DuckDuck
 import re
 import logging
 from typing import Dict, Any, List
-from ddgs import DDGS
+from duckduckgo_search import DDGS
 from openai import OpenAI
 from config import settings
 import json

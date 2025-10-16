@@ -16,7 +16,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./logs:/app/logs
-      - ./sessions.db:/app/sessions.db  # Persist session history database
+      - ./data:/app/data
     networks:
       - heat_up_network
     healthcheck:

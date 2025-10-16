@@ -14,7 +14,7 @@ from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
-DATABASE_PATH = "sessions.db"
+DATABASE_PATH = "data/sessions.db"
 
 
 @contextmanager

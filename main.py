@@ -186,8 +186,22 @@ async def warmup_session(
     logger.info(f"Received warmup request for session: {session_id}")
     
     try:
-        # Generate action plan
-        action_plan = await llm_agent.generate_action_plan(session_id)
+        # Get account and persona data
+        from database import get_account, get_persona
+        account_data = get_account(session_id)
+        persona_data = None
+        
+        if account_data and account_data.get('id'):
+            persona_data = get_persona(account_data['id'])
+            if persona_data:
+                logger.info(f"📋 Using persona for {session_id}: {persona_data.get('generated_name', 'Unknown')}")
+            else:
+                logger.info(f"⚠️ No persona found for account {account_data.get('id')}")
+        else:
+            logger.info(f"⚠️ No account data found for session {session_id}")
+        
+        # Generate action plan with persona
+        action_plan = await llm_agent.generate_action_plan(session_id, account_data, persona_data)
         
         logger.info(f"Generated {len(action_plan)} actions for session {session_id}")
         
@@ -247,8 +261,22 @@ async def warmup_session_sync(
     logger.info(f"Received sync warmup request for session: {session_id}")
     
     try:
-        # Generate action plan
-        action_plan = await llm_agent.generate_action_plan(session_id)
+        # Get account and persona data
+        from database import get_account, get_persona
+        account_data = get_account(session_id)
+        persona_data = None
+        
+        if account_data and account_data.get('id'):
+            persona_data = get_persona(account_data['id'])
+            if persona_data:
+                logger.info(f"📋 Using persona for {session_id}: {persona_data.get('generated_name', 'Unknown')}")
+            else:
+                logger.info(f"⚠️ No persona found for account {account_data.get('id')}")
+        else:
+            logger.info(f"⚠️ No account data found for session {session_id}")
+        
+        # Generate action plan with persona
+        action_plan = await llm_agent.generate_action_plan(session_id, account_data, persona_data)
         
         logger.info(f"Generated {len(action_plan)} actions for session {session_id}")
         
