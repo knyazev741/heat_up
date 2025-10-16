@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation (не нужна в контейнере)
+docs/
+*.md
+!README.md
+
+# Scripts (вспомогательные скрипты не нужны в контейнере)
+scripts/validate_setup.py
+scripts/example_usage.py
+scripts/*.sh
+
+# Tests
+tests/
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+console_output.log
+server.log
+
+# Session files
+my_sessions.txt
+sessions.txt.example
+example_session_add.txt
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Data files that might be large or not needed
+search_results_test.json
+

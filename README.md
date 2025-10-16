@@ -182,7 +182,7 @@ curl "http://localhost:8080/sessions/abc123xyz789/history?days=30"
 
 ### 🆕 TGStat и История Сессий
 
-Подробная документация по новым функциям: **[TGSTAT_INTEGRATION.md](TGSTAT_INTEGRATION.md)**
+Подробная документация по новым функциям: **[TGSTAT_INTEGRATION.md](docs/guides/TGSTAT_INTEGRATION.md)**
 
 - Реальные каналы из TGStat
 - SQLite база данных для истории

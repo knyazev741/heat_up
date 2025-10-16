@@ -50,7 +50,7 @@ VERIFIED_CHANNELS = [
 ]
 
 
-def load_channels_from_file(filepath: str = "channels_data.json") -> List[dict]:
+def load_channels_from_file(filepath: str = "data/channels_data.json") -> List[dict]:
     """
     Load channels from JSON file
     
@@ -76,7 +76,7 @@ def load_channels_from_file(filepath: str = "channels_data.json") -> List[dict]:
         return []
 
 
-def load_bots_from_file(filepath: str = "bots_data.json") -> List[dict]:
+def load_bots_from_file(filepath: str = "data/bots_data.json") -> List[dict]:
     """
     Load bots from JSON file
     

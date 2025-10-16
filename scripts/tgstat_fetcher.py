@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 TGSTAT_API_TOKEN = "2539dfbdf80afd5c45d0c8f86cc9d21a"
 TGSTAT_BASE_URL = "https://api.tgstat.ru"
-OUTPUT_FILE = "channels_data.json"
+OUTPUT_FILE = "../data/channels_data.json"  # Relative to scripts/ folder
 
 # Categories and search queries to get diverse channels
 SEARCH_QUERIES = [
