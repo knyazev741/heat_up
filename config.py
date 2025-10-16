@@ -44,9 +44,9 @@ settings = Settings()
 
 
 # Hardcoded verified channels as fallback
+# УБРАЛИ @telegram и @durov - слишком очевидно и все на них подписываются
 VERIFIED_CHANNELS = [
-    {"username": "@durov", "description": "Pavel Durov's official channel", "category": "Verified"},
-    {"username": "@telegram", "description": "Telegram official news and updates", "category": "Verified"},
+    # Пустой список - будем использовать только из channels_catalog
 ]
 
 

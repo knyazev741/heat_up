@@ -14,7 +14,7 @@ class ActionPlannerAgent:
     
     def __init__(self):
         self.client = OpenAI(api_key=settings.openai_api_key)
-        self.model = "gpt-4o-mini"
+        self.model = "gpt-4o"  # Используем полную модель для лучшего разнообразия
         
     def _build_prompt(self, session_id: str, account_data: Dict[str, Any] = None, persona_data: Dict[str, Any] = None) -> str:
         """
@@ -45,20 +45,32 @@ class ActionPlannerAgent:
         # Get relevant chats for this persona
         relevant_chats = []
         if account_id:
-            relevant_chats = get_relevant_chats(account_id, limit=15)
+            all_chats = get_relevant_chats(account_id, limit=50)
+            logger.info(f"📊 get_relevant_chats({account_id}) returned {len(all_chats)} chats")
+            # ФИЛЬТР: ТОЛЬКО каналы с relevance_score >= 0.4
+            relevant_chats = [ch for ch in all_chats if ch.get('relevance_score', 0) >= 0.4]
+            logger.info(f"📊 After filtering (>=0.4): {len(relevant_chats)} chats")
+            if relevant_chats:
+                for i, ch in enumerate(relevant_chats[:5]):
+                    logger.info(f"  {i+1}. {ch.get('chat_username')} (score: {ch.get('relevance_score', 0):.2f})")
         
-        # Build channels list (mix of relevant and general)
+        # Build channels list (ТОЛЬКО релевантные!)
         if relevant_chats:
             channels_list = "\n".join([
                 f"- {ch['chat_username']}: {ch.get('chat_title', 'Unknown')} "
-                f"(relevance: {ch.get('relevance_score', 0):.1f}) - {ch.get('relevance_reason', '')[:50]}" 
-                for ch in relevant_chats[:10]
+                f"(релевантность: {ch.get('relevance_score', 0):.1f}) - {ch.get('relevance_reason', '')[:80]}" 
+                for ch in relevant_chats[:15]
             ])
+            logger.info(f"✅ Using {len(relevant_chats[:15])} RELEVANT chats from discovered_chats")
+            logger.info(f"📝 Channels list:\n{channels_list[:300]}...")
         else:
+            # Если НЕТ релевантных - используем общие, но БЕЗ @telegram/@durov
+            fallback_channels = [ch for ch in CHANNEL_POOL if ch['username'] not in ['@telegram', '@durov']]
             channels_list = "\n".join([
                 f"- {ch['username']}: {ch['description']}" 
-                for ch in CHANNEL_POOL[:10]
+                for ch in fallback_channels[:10]
             ])
+            logger.warning(f"⚠️ NO relevant chats! Using fallback: {len(fallback_channels[:10])} channels")
         
         bots_list = "\n".join([
             f"- {bot['username']}: {bot['description']}" 
@@ -121,30 +133,36 @@ class ActionPlannerAgent:
 
 Твоя задача - сгенерировать реалистичную последовательность действий, которые ты бы совершил в Telegram СЕГОДНЯ.
 
-Доступные каналы/чаты для взаимодействия:
+📋 ДОСТУПНЫЕ КАНАЛЫ (подобраны СПЕЦИАЛЬНО для ТВОИХ интересов):
 {channels_list}
 
-Доступные боты:
+⚠️ КРИТИЧЕСКИ ВАЖНО:
+- Используй ТОЛЬКО каналы из списка выше!
+- Выбирай каналы с ВЫСОКОЙ релевантностью (>0.7) в первую очередь
+- НЕ используй @telegram или @durov - это слишком очевидно
+- Каждый человек вступает в РАЗНЫЕ каналы, соответствующие СВОИМ интересам!
+
+🤖 Доступные боты:
 {bots_list}
 
 ДОСТУПНЫЕ ТИПЫ ДЕЙСТВИЙ (выбирай только из разрешенных для текущей стадии!):
 
-БАЗОВЫЕ ДЕЙСТВИЯ:
-1. "update_profile" - Обновить профиль (имя, фото, био)
-   - Params: first_name, last_name, bio
-   - Только для стадий 1-3!
+БАЗОВЫЕ ДЕЙСТВИЯ (JSON формат - БЕЗ вложенного "params"!):
 
-2. "join_channel" - Вступить в канал/группу
-   - Params: channel_username
-   
-3. "read_messages" - Читать сообщения в канале
-   - Params: channel_username, duration_seconds (3-20)
-   
-4. "idle" - Пауза/перерыв
-   - Params: duration_seconds (2-10)
+1. update_profile (только стадии 1-3):
+   {{"action": "update_profile", "first_name": "Имя", "last_name": "Фамилия", "bio": "Описание", "reason": "Настраиваю профиль"}}
 
-5. "view_profile" - Посмотреть профиль канала
-   - Params: channel_username, duration_seconds (3-8)
+2. join_channel:
+   {{"action": "join_channel", "channel_username": "@example", "reason": "Интересная тематика"}}
+
+3. read_messages:
+   {{"action": "read_messages", "channel_username": "@example", "duration_seconds": 15, "reason": "Читаю контент"}}
+
+4. idle:
+   {{"action": "idle", "duration_seconds": 7, "reason": "Короткая пауза"}}
+
+5. view_profile:
+   {{"action": "view_profile", "channel_username": "@example", "duration_seconds": 5, "reason": "Изучаю канал"}}
 
 ПРОДВИНУТЫЕ ДЕЙСТВИЯ (доступны с определенных стадий):
 6. "react_to_message" - Поставить реакцию на сообщение
@@ -183,26 +201,22 @@ class ActionPlannerAgent:
 - Включай паузы (idle) между действиями
 - Количество действий: от {max(3, guidelines['max_actions'] - 5)} до {guidelines['max_actions']}
 
-Пример для СТАДИИ 1 (только профиль):
-[
-  {{"action": "update_profile", "first_name": "{persona_data.get('generated_name', 'User').split()[0] if persona_data else 'User'}", "last_name": "{persona_data.get('generated_name', 'User').split()[-1] if persona_data else 'User'}", "bio": "Краткое описание", "reason": "Настраиваю профиль"}},
-  {{"action": "idle", "duration_seconds": 5, "reason": "Осматриваюсь"}},
-  {{"action": "idle", "duration_seconds": 8, "reason": "Изучаю интерфейс"}}
-]
+⚠️ КРИТИЧЕСКИ ВАЖНО - ВЫБОР КАНАЛОВ:
+- ИСПОЛЬЗУЙ ТОЛЬКО каналы из списка "Доступные каналы/чаты" выше
+- ПРИОРИТЕТ №1: Группы ГОРОДА с высокой релевантностью (chat_type: group)
+- ПРИОРИТЕТ №2: Тематические группы по ИНТЕРЕСАМ персоны
+- НИКОГДА не придумывай username сам - ТОЛЬКО из списка!
+- Выбирай каналы с ВЫСОКОЙ релевантностью (0.8+)
+- Чем выше relevance_score - тем лучше подходит канал
 
-Пример для СТАДИИ 5+ (первая активность):
-[
-  {{"action": "view_profile", "channel_username": "@telegram", "duration_seconds": 5, "reason": "Смотрю информацию о канале"}},
-  {{"action": "join_channel", "channel_username": "@telegram", "reason": "Интересный канал, вступаю"}},
-  {{"action": "read_messages", "channel_username": "@telegram", "duration_seconds": 12, "reason": "Читаю последние обновления"}},
-  {{"action": "react_to_message", "channel_username": "@telegram", "reason": "Понравился пост про новые функции"}},
-  {{"action": "idle", "duration_seconds": 6, "reason": "Небольшой перерыв"}},
-  {{"action": "message_bot", "bot_username": "@wiki", "message": "/start", "reason": "Интересно попробовать Википедия-бота"}},
-  {{"action": "idle", "duration_seconds": 4, "reason": "Читаю ответ бота"}}
-]
+🎯 ТВОЯ ЗАДАЧА:
+1. Посмотри на СВОИ интересы: {', '.join(persona_data.get('interests', [])) if persona_data else 'общие'}
+2. Выбери каналы из списка выше, которые соответствуют ТВОИМ интересам (с высокой релевантностью)
+3. Сгенерируй УНИКАЛЬНУЮ последовательность, НЕ ПОХОЖУЮ на примеры
+4. Каждый человек действует ПО-РАЗНОМУ - варьируй порядок, каналы, длительности!
 
-СГЕНЕРИРУЙ УНИКАЛЬНУЮ последовательность действий для СВОЕЙ личности на текущей стадии {warmup_stage}!
-Формат ответа - ТОЛЬКО JSON массив объектов, без дополнительного текста!"""
+Стадия: {warmup_stage}
+Формат ответа - ТОЛЬКО JSON массив, без текста!"""
 
     async def generate_action_plan(self, session_id: str, account_data: Dict[str, Any] = None, persona_data: Dict[str, Any] = None) -> List[Dict[str, Any]]:
         """
@@ -307,8 +321,10 @@ class ActionPlannerAgent:
         validated = []
         
         valid_actions = {
-            "join_channel", "read_messages", "idle",
-            "react_to_message", "message_bot", "view_profile"
+            "update_profile", "join_channel", "read_messages", "idle",
+            "react_to_message", "message_bot", "view_profile",
+            "reply_in_chat", "sync_contacts", "update_privacy",
+            "create_group", "forward_message"
         }
         
         for action in actions:
@@ -321,7 +337,11 @@ class ActionPlannerAgent:
                 continue
             
             # Validate required fields
-            if action_type == "join_channel":
+            if action_type == "update_profile":
+                # update_profile is always valid - all fields are optional
+                validated.append(action)
+                    
+            elif action_type == "join_channel":
                 if "channel_username" in action:
                     validated.append(action)
                     
@@ -367,34 +387,23 @@ class ActionPlannerAgent:
         return validated
     
     def _get_fallback_actions(self) -> List[Dict[str, Any]]:
-        """Return a safe fallback sequence if LLM fails"""
+        """Return a safe fallback sequence if LLM fails - ТОЛЬКО idle действия"""
+        logger.warning("⚠️ USING FALLBACK ACTIONS - LLM generation failed!")
         return [
             {
-                "action": "join_channel",
-                "channel_username": "@telegram",
-                "reason": "Join official Telegram channel"
-            },
-            {
-                "action": "read_messages",
-                "channel_username": "@telegram",
-                "duration_seconds": 8,
-                "reason": "Browse official updates"
+                "action": "idle",
+                "duration_seconds": 10,
+                "reason": "Waiting"
             },
             {
                 "action": "idle",
-                "duration_seconds": 5,
+                "duration_seconds": 8,
+                "reason": "Thinking"
+            },
+            {
+                "action": "idle",
+                "duration_seconds": 12,
                 "reason": "Short break"
-            },
-            {
-                "action": "join_channel",
-                "channel_username": "@durov",
-                "reason": "Join Pavel Durov's channel"
-            },
-            {
-                "action": "read_messages",
-                "channel_username": "@durov",
-                "duration_seconds": 10,
-                "reason": "Read posts"
             }
         ]
 

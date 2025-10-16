@@ -70,7 +70,8 @@ def init_database():
                 first_warmup_date DATETIME,
                 last_warmup_date DATETIME,
                 
-                daily_activity_count INTEGER DEFAULT 3,
+                min_daily_activity INTEGER DEFAULT 3,
+                max_daily_activity INTEGER DEFAULT 6,
                 last_activity_times TEXT,
                 
                 total_warmups INTEGER DEFAULT 0,
@@ -413,7 +414,8 @@ def add_account(
     session_id: str,
     phone_number: str,
     country: Optional[str] = None,
-    daily_activity_count: int = 3,
+    min_daily_activity: int = 3,
+    max_daily_activity: int = 6,
     **kwargs
 ) -> Optional[int]:
     """
@@ -423,7 +425,8 @@ def add_account(
         session_id: Telegram session UID
         phone_number: Phone number
         country: Country code
-        daily_activity_count: How many times per day to warmup
+        min_daily_activity: Minimum warmups per day
+        max_daily_activity: Maximum warmups per day
         **kwargs: Additional fields
         
     Returns:
@@ -435,16 +438,17 @@ def add_account(
             cursor.execute(
                 """
                 INSERT INTO accounts (
-                    session_id, phone_number, country, daily_activity_count,
+                    session_id, phone_number, country, min_daily_activity, max_daily_activity,
                     provider, proxy_id, first_warmup_date
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
                     phone_number,
                     country,
-                    daily_activity_count,
+                    min_daily_activity,
+                    max_daily_activity,
                     kwargs.get("provider"),
                     kwargs.get("proxy_id"),
                     datetime.utcnow()

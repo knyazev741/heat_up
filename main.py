@@ -329,7 +329,7 @@ async def add_account_endpoint(request: AddAccountRequest):
     Add new account to warmup system
     
     1. Generate unique persona for this account
-    2. Use persona's daily_activity_count (unless specified manually)
+    2. Use persona's activity range (min-max daily activities, unless specified manually)
     3. Find relevant chats based on persona
     4. Add account to DB
     
@@ -353,13 +353,16 @@ async def add_account_endpoint(request: AddAccountRequest):
             request.country
         )
         
-        # 2. Use daily_activity_count from persona if not specified
-        daily_activity_count = request.daily_activity_count
-        if daily_activity_count is None:
-            daily_activity_count = persona_data.get("daily_activity_count", 4)
-            logger.info(f"Using LLM-generated daily_activity_count: {daily_activity_count}")
+        # 2. Use activity range from persona if not specified
+        min_daily = request.min_daily_activity
+        max_daily = request.max_daily_activity
+        
+        if min_daily is None or max_daily is None:
+            min_daily = persona_data.get("min_daily_activity", 3)
+            max_daily = persona_data.get("max_daily_activity", 6)
+            logger.info(f"Using LLM-generated activity range: {min_daily}-{max_daily} per day")
         else:
-            logger.info(f"Using manually specified daily_activity_count: {daily_activity_count}")
+            logger.info(f"Using manually specified activity range: {min_daily}-{max_daily} per day")
         
         # 3. Add account to DB
         logger.info("Step 2: Adding account to database...")
@@ -367,7 +370,8 @@ async def add_account_endpoint(request: AddAccountRequest):
             session_id=request.session_id,
             phone_number=phone_number,
             country=persona_data.get("country", request.country),
-            daily_activity_count=daily_activity_count,
+            min_daily_activity=min_daily,
+            max_daily_activity=max_daily,
             provider=request.provider,
             proxy_id=request.proxy_id
         )
@@ -404,7 +408,7 @@ async def add_account_endpoint(request: AddAccountRequest):
                 "persona_generated": True,
                 "persona_name": persona_data.get("generated_name"),
                 "chats_discovered": len(discovered_chats),
-                "daily_activity_count": daily_activity_count
+                "activity_range": f"{min_daily}-{max_daily}"
             }
         )
     
@@ -613,8 +617,10 @@ async def update_account_endpoint(account_id: int, request: UpdateAccountRequest
         
         # Build update dict from request
         update_data = {}
-        if request.daily_activity_count is not None:
-            update_data["daily_activity_count"] = request.daily_activity_count
+        if request.min_daily_activity is not None:
+            update_data["min_daily_activity"] = request.min_daily_activity
+        if request.max_daily_activity is not None:
+            update_data["max_daily_activity"] = request.max_daily_activity
         if request.is_active is not None:
             update_data["is_active"] = request.is_active
         if request.warmup_stage is not None:

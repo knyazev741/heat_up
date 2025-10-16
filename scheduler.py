@@ -137,11 +137,16 @@ class WarmupScheduler:
         """
         
         last_warmup = account.get("last_warmup_date")
-        daily_count = account.get("daily_activity_count", 3)
+        min_daily = account.get("min_daily_activity", 3)
+        max_daily = account.get("max_daily_activity", 6)
+        
+        # Берем случайное количество активностей из диапазона для этого дня
+        import random
+        daily_count = random.randint(min_daily, max_daily)
         
         # Если никогда не прогревали - точно нужно
         if not last_warmup:
-            logger.info(f"Account {account['session_id'][:8]} never warmed up - scheduling")
+            logger.info(f"Account {account['session_id'][:8]} never warmed up - scheduling (target: {daily_count} times/day)")
             return True
         
         try:
@@ -291,6 +296,10 @@ class WarmupScheduler:
                         logger.info(f"🎉 Account progressed to stage {new_stage}")
                 except Exception as e:
                     logger.error(f"Error updating stage: {e}")
+            
+            # 8. КРИТИЧЕСКИ ВАЖНО: Обновить last_warmup_date в БД
+            update_account(session_id, last_warmup_date=completed_at.isoformat())
+            logger.info(f"📅 Updated last_warmup_date: {completed_at.isoformat()}")
             
             logger.info("=" * 100)
             logger.info(f"✅ WARMUP COMPLETED in {duration:.1f}s")
