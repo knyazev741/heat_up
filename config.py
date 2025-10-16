@@ -149,15 +149,16 @@ ACTION_DELAYS = {
 WARMUP_GUIDELINES = {
     1: {
         "description": "Новый пользователь, первый вход",
-        "max_actions": 3,
-        "allowed_actions": ["update_profile", "idle"],
-        "max_joins": 0,
+        "max_actions": 5,
+        "allowed_actions": ["update_profile", "join_channel", "view_profile", "read_messages", "idle"],
+        "max_joins": 2,
         "max_messages": 0,
         "recommendations": [
-            "Только настройка профиля",
-            "Добавить фото с лицом",
-            "Установить реалистичное имя и фамилию",
-            "Больше ничего не делать!"
+            "Настроить профиль (имя, фото, био)",
+            "Зайти в 1-2 интересных канала",
+            "Посмотреть что там пишут",
+            "Пока НИЧЕГО не писать",
+            "Вести себя естественно - паузы, чтение"
         ]
     },
     2: {

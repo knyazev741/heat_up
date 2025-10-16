@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 from datetime import datetime
 from openai import OpenAI
 from config import settings, CHANNEL_POOL, BOTS_POOL, WARMUP_GUIDELINES, RED_FLAGS, GREEN_FLAGS
-from database import get_session_summary, get_account, get_persona, get_relevant_chats
+from database import get_session_summary, get_session_history, get_account, get_persona, get_relevant_chats
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,10 @@ class ActionPlannerAgent:
         
         # Get warmup guidelines for current stage
         guidelines = WARMUP_GUIDELINES.get(warmup_stage, WARMUP_GUIDELINES[1])
+        
+        # Get session history (последние 3 сеанса)
+        session_summary = get_session_summary(session_id, days=7)
+        recent_history = get_session_history(session_id, days=7)
         
         # Get relevant chats for this persona
         relevant_chats = []
@@ -125,11 +129,92 @@ class ActionPlannerAgent:
 {chr(10).join(['- ' + flag for flag in GREEN_FLAGS[:5]])}
 """
         
+        # Build history context
+        history_context = ""
+        if recent_history:
+            import json
+            from datetime import datetime
+            
+            # Группируем по сеансам (примерно по времени)
+            sessions_grouped = []
+            current_session = []
+            last_time = None
+            
+            for action in reversed(recent_history[-15:]):  # Последние 15 действий
+                action_time = datetime.fromisoformat(action['timestamp'])
+                
+                if last_time and (action_time - last_time).total_seconds() > 3600:
+                    # Больше часа - новый сеанс
+                    if current_session:
+                        sessions_grouped.append(current_session)
+                    current_session = []
+                
+                current_session.append(action)
+                last_time = action_time
+            
+            if current_session:
+                sessions_grouped.append(current_session)
+            
+            # Берем последние 3 сеанса
+            recent_sessions = sessions_grouped[-3:]
+            
+            history_lines = []
+            for i, session in enumerate(recent_sessions, 1):
+                if session:
+                    first_action_time = datetime.fromisoformat(session[0]['timestamp'])
+                    time_ago = datetime.utcnow() - first_action_time
+                    
+                    if time_ago.days > 0:
+                        time_str = f"{time_ago.days} дн. назад"
+                    elif time_ago.seconds > 3600:
+                        time_str = f"{time_ago.seconds // 3600} ч. назад"
+                    else:
+                        time_str = f"{time_ago.seconds // 60} мин. назад"
+                    
+                    history_lines.append(f"\nСеанс {i} ({time_str}):")
+                    
+                    for action in session[:5]:  # До 5 действий на сеанс
+                        try:
+                            # action_data уже dict (database.py конвертирует автоматически)
+                            data = action['action_data'] if action['action_data'] else {}
+                            action_type = action['action_type']
+                            
+                            if action_type == 'update_profile':
+                                bio = data.get('bio', '')[:50]
+                                history_lines.append(f"  - Обновил профиль{': ' + bio if bio else ''}")
+                            elif action_type == 'join_channel':
+                                channel = data.get('channel_username', '')
+                                history_lines.append(f"  - Вступил в {channel}")
+                            elif action_type == 'view_profile':
+                                channel = data.get('channel_username', '')
+                                history_lines.append(f"  - Просмотрел {channel}")
+                            elif action_type == 'read_messages':
+                                channel = data.get('channel_username', '')
+                                history_lines.append(f"  - Читал {channel}")
+                            elif action_type == 'idle':
+                                duration = data.get('duration_seconds', 0)
+                                history_lines.append(f"  - Пауза ({duration}с)")
+                            else:
+                                history_lines.append(f"  - {action_type}")
+                        except:
+                            pass
+            
+            if history_lines:
+                history_context = f"""
+📜 ТВОЯ ПОСЛЕДНЯЯ АКТИВНОСТЬ:
+{chr(10).join(history_lines)}
+
+⚠️ НЕ ПОВТОРЯЙ предыдущие действия! Если ты уже обновлял профиль - НЕ обновляй его снова.
+⚠️ Если уже вступал в канал - ВСТУПИ В ДРУГОЙ или ЧИТАЙ сообщения в нем.
+⚠️ Веди себя РАЗНООБРАЗНО, как настоящий человек!
+"""
+        
         return f"""{persona_context}
 
 {stage_guidance}
 
 {flags_guidance}
+{history_context}
 
 Твоя задача - сгенерировать реалистичную последовательность действий, которые ты бы совершил в Telegram СЕГОДНЯ.
 

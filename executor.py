@@ -340,27 +340,76 @@ class ActionExecutor:
     
     async def _update_profile(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
         """Update profile information"""
+        from telegram_tl_helpers import make_update_profile_query
+        
         first_name = action.get("first_name")
         last_name = action.get("last_name")
         bio = action.get("bio")
         
-        logger.info(f"Updating profile: {first_name} {last_name}")
+        logger.info(f"Updating profile for session {session_id}: {first_name} {last_name}")
         
-        # For now, return success - actual implementation would use TL methods
-        # This would require raw TL invoke for UpdateProfile
-        result = {
-            "action": "update_profile",
-            "status": "completed",
-            "first_name": first_name,
-            "last_name": last_name,
-            "bio": bio
-        }
-        
-        # Simulate time spent updating profile
-        await asyncio.sleep(random.uniform(3, 7))
-        
-        logger.info("Profile update completed (simulated)")
-        return result
+        try:
+            # Create TL query for profile update
+            query = make_update_profile_query(
+                first_name=first_name,
+                last_name=last_name,
+                about=bio  # 'about' is the TL field for bio
+            )
+            
+            logger.debug(f"Profile update query: {query}")
+            
+            # Execute via telegram_client
+            response = await self.telegram_client.invoke_raw(
+                session_id=session_id,
+                query=query,
+                retries=3,
+                timeout=15
+            )
+            
+            if response.get("success"):
+                logger.info(f"Profile updated successfully for session {session_id}")
+                return {
+                    "action": "update_profile",
+                    "status": "completed",
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "bio": bio,
+                    "telegram_response": response.get("result")
+                }
+            else:
+                error_msg = response.get("error", "Unknown error")
+                logger.error(f"Failed to update profile for session {session_id}: {error_msg}")
+                
+                # Check if session is frozen
+                if "frozen" in error_msg.lower():
+                    return {
+                        "action": "update_profile",
+                        "status": "failed",
+                        "error": "Session is frozen",
+                        "first_name": first_name,
+                        "last_name": last_name,
+                        "bio": bio
+                    }
+                
+                return {
+                    "action": "update_profile",
+                    "status": "failed",
+                    "error": error_msg,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "bio": bio
+                }
+                
+        except Exception as e:
+            logger.error(f"Exception during profile update for session {session_id}: {str(e)}")
+            return {
+                "action": "update_profile",
+                "status": "failed",
+                "error": str(e),
+                "first_name": first_name,
+                "last_name": last_name,
+                "bio": bio
+            }
     
     async def _sync_contacts(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
         """Synchronize contacts"""

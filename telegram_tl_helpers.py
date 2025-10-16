@@ -6,6 +6,8 @@ Uses pylogram to create proper TL objects that match the server's Layer.
 import pylogram.raw.types
 import pylogram.raw.functions.messages
 import pylogram.raw.functions.channels
+import pylogram.raw.functions.account
+import pylogram.raw.functions.users
 from pylogram.raw.core import TLObject
 
 
@@ -170,4 +172,47 @@ def make_input_peer_user(user_id: int, access_hash: int) -> pylogram.raw.types.I
         user_id=user_id,
         access_hash=access_hash
     )
+
+
+def make_update_profile_query(
+    first_name: str = None,
+    last_name: str = None,
+    about: str = None
+) -> str:
+    """
+    Create UpdateProfile query to update user's profile information
+    
+    Args:
+        first_name: New first name (optional)
+        last_name: New last name (optional)
+        about: New bio/about text (optional)
+        
+    Returns:
+        String representation of TL query
+        
+    Note:
+        At least one parameter must be provided. Use empty string "" to clear a field.
+    """
+    raw_method = pylogram.raw.functions.account.UpdateProfile(
+        first_name=first_name,
+        last_name=last_name,
+        about=about
+    )
+    
+    return raw_method_to_string(raw_method)
+
+
+def make_get_full_user_query() -> str:
+    """
+    Create GetFullUser query to get current user's full information
+    
+    Returns:
+        String representation of TL query
+    """
+    # Use InputUserSelf to get current user
+    raw_method = pylogram.raw.functions.users.GetFullUser(
+        id=pylogram.raw.types.InputUserSelf()
+    )
+    
+    return raw_method_to_string(raw_method)
 
