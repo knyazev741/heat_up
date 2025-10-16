@@ -287,4 +287,151 @@ class TelegramAPIClient:
         except Exception as e:
             logger.error(f"Error getting messages: {str(e)}")
             return {"error": str(e)}
+    
+    async def get_session_info(self, session_id: str) -> Dict[str, Any]:
+        """
+        Get session information including premium status
+        
+        Args:
+            session_id: Telegram session UID
+            
+        Returns:
+            Session data with is_premium and premium_end_date fields
+        """
+        url = f"{self.base_url}/api/external/sessions/{session_id}"
+        
+        logger.debug(f"Getting session info for {session_id}")
+        
+        try:
+            response = await self.client.get(
+                url,
+                headers=self._get_headers()
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Failed to get session info: {e.response.text}")
+            return {"error": str(e), "status_code": e.response.status_code}
+        except Exception as e:
+            logger.error(f"Error getting session info: {str(e)}")
+            return {"error": str(e)}
+    
+    async def get_sponsored_messages(
+        self,
+        session_id: str,
+        channel_username: str
+    ) -> Dict[str, Any]:
+        """
+        Get official sponsored messages (ads) for a channel
+        
+        According to Telegram's custom client guidelines, this MUST be called
+        when opening channels/bots for non-premium users to display official ads.
+        
+        Args:
+            session_id: Telegram session UID
+            channel_username: Channel username (e.g., @SecretAdTestChannel)
+            
+        Returns:
+            API response with sponsored messages or empty if premium/no ads
+        """
+        from telegram_tl_helpers import make_resolve_username_query, make_get_sponsored_messages_query, make_input_peer_channel
+        
+        # First, resolve username to get InputPeer
+        resolve_query = make_resolve_username_query(channel_username)
+        resolve_result = await self.invoke_raw(session_id, resolve_query)
+        
+        if resolve_result.get("error") or not resolve_result.get("success"):
+            logger.warning(f"Failed to resolve {channel_username}: {resolve_result.get('error')}")
+            return resolve_result
+        
+        # Extract peer info from resolved result
+        result = resolve_result.get("result", {})
+        peer = result.get("peer")
+        chats = result.get("chats", [])
+        
+        if not peer or not chats:
+            logger.warning(f"No peer/chats found for {channel_username}")
+            return {"error": "Failed to resolve channel"}
+        
+        # Find the channel in chats to get channel_id and access_hash
+        channel_id = None
+        access_hash = None
+        
+        for chat in chats:
+            chat_type = chat.get("_", "")
+            # Check for both "Channel" and "types.Channel"
+            if "Channel" in chat_type:
+                channel_id = chat.get("id")
+                access_hash = chat.get("access_hash")
+                logger.debug(f"Found channel: id={channel_id}, access_hash={access_hash}")
+                break
+        
+        if not channel_id or not access_hash:
+            logger.warning(f"Could not extract channel_id/access_hash for {channel_username}")
+            return {"error": "Failed to get channel info"}
+        
+        # Create InputPeerChannel
+        input_peer = make_input_peer_channel(channel_id, access_hash)
+        
+        # Get sponsored messages
+        sponsored_query = make_get_sponsored_messages_query(input_peer)
+        
+        logger.info(f"🎯 Requesting sponsored messages for {channel_username}")
+        
+        sponsored_result = await self.invoke_raw(session_id, sponsored_query)
+        
+        if sponsored_result.get("success"):
+            logger.info(f"✅ Got sponsored messages response for {channel_username}")
+        
+        return sponsored_result
+    
+    async def view_sponsored_message(
+        self,
+        session_id: str,
+        random_id: bytes
+    ) -> Dict[str, Any]:
+        """
+        Mark sponsored message as viewed
+        
+        Should be called when the ad is fully visible on screen.
+        
+        Args:
+            session_id: Telegram session UID
+            random_id: Random ID from SponsoredMessage
+            
+        Returns:
+            API response
+        """
+        from telegram_tl_helpers import make_view_sponsored_message_query
+        
+        query = make_view_sponsored_message_query(random_id)
+        logger.debug(f"Marking sponsored message as viewed")
+        
+        return await self.invoke_raw(session_id, query)
+    
+    async def click_sponsored_message(
+        self,
+        session_id: str,
+        random_id: bytes,
+        media: bool = False,
+        fullscreen: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Mark sponsored message as clicked
+        
+        Args:
+            session_id: Telegram session UID
+            random_id: Random ID from SponsoredMessage
+            media: True if clicking on media
+            fullscreen: True if video in fullscreen
+            
+        Returns:
+            API response
+        """
+        from telegram_tl_helpers import make_click_sponsored_message_query
+        
+        query = make_click_sponsored_message_query(random_id, media, fullscreen)
+        logger.debug(f"Marking sponsored message as clicked (media={media}, fullscreen={fullscreen})")
+        
+        return await self.invoke_raw(session_id, query)
 

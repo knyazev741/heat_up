@@ -216,3 +216,83 @@ def make_get_full_user_query() -> str:
     
     return raw_method_to_string(raw_method)
 
+
+def make_get_sponsored_messages_query(
+    peer: pylogram.raw.base.input_peer.InputPeer
+) -> str:
+    """
+    Create GetSponsoredMessages query to fetch official ads for channel/bot
+    
+    According to Telegram's custom client guidelines, this must be called
+    when opening channels/bots for non-premium users.
+    
+    Args:
+        peer: InputPeer of the channel or bot chat
+        
+    Returns:
+        String representation of TL query
+        
+    Note:
+        Results should be cached for 5 minutes per channel/bot.
+        Layer 201: In some versions it's messages.GetSponsoredMessages,
+        in others channels.GetSponsoredMessages. Trying channels first.
+    """
+    try:
+        # Try channels.GetSponsoredMessages (more common in newer versions)
+        raw_method = pylogram.raw.functions.channels.GetSponsoredMessages(
+            channel=peer
+        )
+    except AttributeError:
+        # Fallback to messages.GetSponsoredMessages
+        raw_method = pylogram.raw.functions.messages.GetSponsoredMessages(
+            peer=peer
+        )
+    
+    return raw_method_to_string(raw_method)
+
+
+def make_view_sponsored_message_query(random_id: bytes) -> str:
+    """
+    Create ViewSponsoredMessage query to mark ad as viewed
+    
+    Should be called when the entire ad text becomes visible on screen.
+    
+    Args:
+        random_id: Random ID from SponsoredMessage
+        
+    Returns:
+        String representation of TL query
+    """
+    raw_method = pylogram.raw.functions.messages.ViewSponsoredMessage(
+        peer=pylogram.raw.types.InputPeerEmpty(),
+        random_id=random_id
+    )
+    
+    return raw_method_to_string(raw_method)
+
+
+def make_click_sponsored_message_query(
+    random_id: bytes,
+    media: bool = False,
+    fullscreen: bool = False
+) -> str:
+    """
+    Create ClickSponsoredMessage query to mark ad as clicked
+    
+    Args:
+        random_id: Random ID from SponsoredMessage
+        media: True if clicking on media (photo/video)
+        fullscreen: True if video with sound in fullscreen player
+        
+    Returns:
+        String representation of TL query
+    """
+    raw_method = pylogram.raw.functions.messages.ClickSponsoredMessage(
+        peer=pylogram.raw.types.InputPeerEmpty(),
+        random_id=random_id,
+        media=media,
+        fullscreen=fullscreen
+    )
+    
+    return raw_method_to_string(raw_method)
+
