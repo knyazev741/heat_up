@@ -22,8 +22,12 @@ class PersonaAgent:
     """
     
     def __init__(self):
-        self.client = OpenAI(api_key=settings.openai_api_key)
-        self.model = "gpt-4o"  # Полная модель для максимального разнообразия персон
+        # Using DeepSeek API (OpenAI-compatible)
+        self.client = OpenAI(
+            api_key=settings.deepseek_api_key,
+            base_url="https://api.deepseek.com"
+        )
+        self.model = "deepseek-chat"  # DeepSeek model for better cost efficiency
     
     def extract_country_from_phone(self, phone_number: str) -> Optional[str]:
         """

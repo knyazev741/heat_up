@@ -13,8 +13,12 @@ class ActionPlannerAgent:
     """LLM-powered agent that generates natural user behavior sequences"""
     
     def __init__(self):
-        self.client = OpenAI(api_key=settings.openai_api_key)
-        self.model = "gpt-4o"  # Используем полную модель для лучшего разнообразия
+        # Using DeepSeek API (OpenAI-compatible)
+        self.client = OpenAI(
+            api_key=settings.deepseek_api_key,
+            base_url="https://api.deepseek.com"
+        )
+        self.model = "deepseek-chat"  # DeepSeek model for better cost efficiency
         
     def _build_prompt(self, session_id: str, account_data: Dict[str, Any] = None, persona_data: Dict[str, Any] = None) -> str:
         """

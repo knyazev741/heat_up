@@ -24,8 +24,12 @@ class SearchAgent:
     """
     
     def __init__(self):
-        self.client = OpenAI(api_key=settings.openai_api_key)
-        self.model = "gpt-4o"
+        # Using DeepSeek API (OpenAI-compatible)
+        self.client = OpenAI(
+            api_key=settings.deepseek_api_key,
+            base_url="https://api.deepseek.com"
+        )
+        self.model = "deepseek-chat"  # DeepSeek model for better cost efficiency
     
     async def find_relevant_chats(
         self,
