@@ -11,12 +11,20 @@ services:
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TELEGRAM_API_BASE_URL=${TELEGRAM_API_BASE_URL}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - TELEGRAM_API_KEY=${TELEGRAM_API_KEY:-}
     restart: unless-stopped
     volumes:
       - ./logs:/app/logs
+      - ./sessions.db:/app/sessions.db  # Persist session history database
     networks:
       - heat_up_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
 networks:
   heat_up_network:

@@ -3,16 +3,16 @@
 Create a `.env` file in the project root with the following configuration:
 
 ```bash
-# OpenAI API Configuration
-OPENAI_API_KEY=sk-proj-your-openai-api-key-here
+# DeepSeek API Configuration (используется для всех LLM-агентов)
+DEEPSEEK_API_KEY=sk-your-deepseek-api-key-here
 
 # Telegram API Configuration
-TELEGRAM_API_BASE_URL=http://localhost:8000
+TELEGRAM_API_BASE_URL=https://api.knyazservice.com
 TELEGRAM_API_KEY=optional-api-key-if-needed
 
 # TGStat API Configuration
 # Token for fetching real Telegram channels (optional, for manual channel updates)
-TGSTAT_API_TOKEN=2539dfbdf80afd5c45d0c8f86cc9d21a
+TGSTAT_API_TOKEN=your-tgstat-token-here
 
 # Session History Configuration
 # How many days to keep session history (default: 30)
@@ -21,14 +21,21 @@ SESSION_HISTORY_DAYS=30
 # Database path for session history
 DATABASE_PATH=sessions.db
 
+# Scheduler Configuration
+SCHEDULER_ENABLED=true
+SCHEDULER_CHECK_INTERVAL=1800  # seconds (30 minutes)
+
 # Logging
 LOG_LEVEL=INFO
 ```
 
 ## Required Variables
 
-- `OPENAI_API_KEY` - Your OpenAI API key (required)
+- `DEEPSEEK_API_KEY` - Your DeepSeek API key (required) - используется для ActionPlannerAgent, PersonaAgent, SearchAgent
 - `TELEGRAM_API_BASE_URL` - Base URL for Telegram API server (required)
+
+> **Note**: Проект мигрировал с OpenAI на DeepSeek API для экономии ~89% на API costs.
+> См. [DEEPSEEK_MIGRATION.md](DEEPSEEK_MIGRATION.md) для подробностей.
 
 ## Optional Variables
 
@@ -36,6 +43,8 @@ LOG_LEVEL=INFO
 - `TGSTAT_API_TOKEN` - TGStat API token (only needed if you want to fetch new channels manually)
 - `SESSION_HISTORY_DAYS` - Number of days to keep session history (default: 30)
 - `DATABASE_PATH` - Path to SQLite database file (default: sessions.db)
+- `SCHEDULER_ENABLED` - Enable automatic warmup scheduler (default: true)
+- `SCHEDULER_CHECK_INTERVAL` - Scheduler check interval in seconds (default: 1800)
 - `LOG_LEVEL` - Logging level: DEBUG, INFO, WARNING, ERROR (default: INFO)
 
 ## Example Setup
