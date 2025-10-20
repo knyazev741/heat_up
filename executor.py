@@ -155,17 +155,100 @@ class ActionExecutor:
             return {"error": f"Unknown action type: {action_type}"}
     
     async def _join_channel(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Join a channel"""
+        """
+        Join a channel
+        
+        According to Telegram's custom client guidelines, we must request
+        and display sponsored messages for non-premium users when opening channels/bots.
+        """
         channel_username = action.get("channel_username")
         
         if not channel_username:
             return {"error": "Missing channel_username"}
         
+        # Check if user has premium (required by Telegram guidelines)
+        session_info = await self.telegram_client.get_session_info(session_id)
+        is_premium = False
+        
+        if not session_info.get("error"):
+            is_premium = session_info.get("is_premium", False)
+            logger.info(f"📱 Session {session_id} premium status: {is_premium}")
+        
+        # Get sponsored messages if not premium (Telegram requirement for opening channel)
+        sponsored_ads = []
+        if not is_premium:
+            logger.info(f"🎯 Non-premium account - fetching official sponsored messages before join")
+            
+            sponsored_result = await self.telegram_client.get_sponsored_messages(
+                session_id,
+                channel_username
+            )
+            
+            if sponsored_result.get("success"):
+                result_data = sponsored_result.get("result", {})
+                messages = result_data.get("messages", [])
+                
+                if messages and len(messages) > 0:
+                    logger.info(f"📢 Found {len(messages)} sponsored message(s) for {channel_username}")
+                    
+                    for idx, ad in enumerate(messages, 1):
+                        title = ad.get("title", "")
+                        message = ad.get("message", "")
+                        url = ad.get("url", "")
+                        button_text = ad.get("button_text", "")
+                        recommended = ad.get("recommended", False)
+                        random_id = ad.get("random_id")
+                        
+                        logger.info(f"  Ad #{idx}:")
+                        logger.info(f"    Title: {title}")
+                        logger.info(f"    Message: {message[:100]}..." if len(message) > 100 else f"    Message: {message}")
+                        logger.info(f"    URL: {url}")
+                        logger.info(f"    Button: {button_text}")
+                        logger.info(f"    Recommended: {recommended}")
+                        
+                        sponsored_ads.append({
+                            "title": title,
+                            "message": message,
+                            "url": url,
+                            "button_text": button_text,
+                            "recommended": recommended,
+                            "random_id": random_id
+                        })
+                        
+                        # Mark as viewed (required by Telegram guidelines)
+                        if random_id:
+                            try:
+                                await self.telegram_client.view_sponsored_message(
+                                    session_id,
+                                    random_id
+                                )
+                                logger.debug(f"    ✓ Marked ad #{idx} as viewed")
+                            except Exception as e:
+                                logger.warning(f"    ⚠ Failed to mark ad as viewed: {e}")
+                else:
+                    logger.info(f"📭 No sponsored messages available for {channel_username}")
+            elif "AD_EXPIRED" in str(sponsored_result.get("error", "")):
+                logger.info(f"⏰ Sponsored messages expired for {channel_username}")
+            elif "PREMIUM_ACCOUNT_REQUIRED" in str(sponsored_result.get("error", "")):
+                logger.info(f"💎 Account is actually premium (server says so)")
+            else:
+                logger.warning(f"⚠ Could not fetch sponsored messages: {sponsored_result.get('error')}")
+        else:
+            logger.info(f"💎 Premium account - skipping sponsored messages")
+        
+        # Now join the channel
         result = await self.telegram_client.join_chat(session_id, channel_username)
         
         if not result.get("error"):
             self.joined_channels.add(channel_username)
             logger.info(f"Successfully joined {channel_username}")
+        
+        # Add sponsored ads info to result
+        if sponsored_ads:
+            result["sponsored_ads_count"] = len(sponsored_ads)
+            result["sponsored_ads"] = sponsored_ads
+        
+        result["is_premium"] = is_premium
         
         return result
     

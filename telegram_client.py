@@ -139,6 +139,7 @@ class TelegramAPIClient:
         }
         
         logger.info(f"Invoking raw query for session {session_id}")
+        logger.debug(f"Query: {query[:200]}..." if len(query) > 200 else f"Query: {query}")
         
         try:
             response = await self.client.post(
@@ -371,10 +372,10 @@ class TelegramAPIClient:
             return {"error": "Failed to get channel info"}
         
         # Create InputPeerChannel
-        input_peer = make_input_peer_channel(channel_id, access_hash)
+        input_peer_channel = make_input_peer_channel(channel_id, access_hash)
         
         # Get sponsored messages
-        sponsored_query = make_get_sponsored_messages_query(input_peer)
+        sponsored_query = make_get_sponsored_messages_query(input_peer_channel)
         
         logger.info(f"🎯 Requesting sponsored messages for {channel_username}")
         

@@ -218,7 +218,7 @@ def make_get_full_user_query() -> str:
 
 
 def make_get_sponsored_messages_query(
-    peer: pylogram.raw.base.input_peer.InputPeer
+    channel: pylogram.raw.types.InputPeerChannel
 ) -> str:
     """
     Create GetSponsoredMessages query to fetch official ads for channel/bot
@@ -227,28 +227,20 @@ def make_get_sponsored_messages_query(
     when opening channels/bots for non-premium users.
     
     Args:
-        peer: InputPeer of the channel or bot chat
+        channel: InputPeerChannel with channel_id and access_hash
+                 Example: InputPeerChannel(channel_id=1453605446, access_hash=-59287541491096514)
         
     Returns:
         String representation of TL query
         
     Note:
         Results should be cached for 5 minutes per channel/bot.
-        Layer 201: In some versions it's messages.GetSponsoredMessages,
-        in others channels.GetSponsoredMessages. Trying channels first.
+        Uses channels.GetSponsoredMessages (channel parameter).
+        Format: pylogram.raw.functions.channels.GetSponsoredMessages(channel=InputPeerChannel(...))
     """
-    try:
-        # Try channels.GetSponsoredMessages (more common in newer versions)
-        raw_method = pylogram.raw.functions.channels.GetSponsoredMessages(
-            channel=peer
-        )
-    except AttributeError:
-        # Fallback to messages.GetSponsoredMessages
-        raw_method = pylogram.raw.functions.messages.GetSponsoredMessages(
-            peer=peer
-        )
-    
-    return raw_method_to_string(raw_method)
+    # Server expects channels.GetSponsoredMessages with channel= parameter
+    # Build string representation directly since pylogram 0.12.3 doesn't have this in channels module
+    return f"pylogram.raw.functions.channels.GetSponsoredMessages(channel={repr(channel)})"
 
 
 def make_view_sponsored_message_query(random_id: bytes) -> str:
@@ -264,7 +256,6 @@ def make_view_sponsored_message_query(random_id: bytes) -> str:
         String representation of TL query
     """
     raw_method = pylogram.raw.functions.messages.ViewSponsoredMessage(
-        peer=pylogram.raw.types.InputPeerEmpty(),
         random_id=random_id
     )
     
@@ -288,7 +279,6 @@ def make_click_sponsored_message_query(
         String representation of TL query
     """
     raw_method = pylogram.raw.functions.messages.ClickSponsoredMessage(
-        peer=pylogram.raw.types.InputPeerEmpty(),
         random_id=random_id,
         media=media,
         fullscreen=fullscreen
