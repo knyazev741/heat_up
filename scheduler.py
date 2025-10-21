@@ -232,7 +232,39 @@ class WarmupScheduler:
             
             # 3. Обновить пул чатов (если нужно)
             relevant_chats = get_relevant_chats(account_id, limit=15)
+            
+            # Проверяем когда последний раз искали каналы (не искать если < 5 дней назад)
+            should_search_chats = False
             if len(relevant_chats) < 5 and persona:
+                # Проверяем последний discovered_at
+                from datetime import datetime, timedelta
+                import sqlite3
+                
+                conn = sqlite3.connect('data/sessions.db')
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT MAX(discovered_at) as last_search
+                    FROM discovered_chats
+                    WHERE account_id = ?
+                """, (account_id,))
+                row = cursor.fetchone()
+                conn.close()
+                
+                if row and row[0]:
+                    last_search = datetime.fromisoformat(row[0])
+                    days_since_search = (datetime.utcnow() - last_search).days
+                    
+                    if days_since_search >= 5:
+                        logger.info(f"📅 Last search was {days_since_search} days ago - will search again")
+                        should_search_chats = True
+                    else:
+                        logger.info(f"⏳ Last search was {days_since_search} days ago - skipping (wait {5 - days_since_search} more days)")
+                else:
+                    # Никогда не искали - можно искать
+                    logger.info("🆕 Never searched for chats - will search now")
+                    should_search_chats = True
+            
+            if should_search_chats:
                 logger.info("🔍 Finding relevant chats for persona...")
                 try:
                     new_chats = await self.search_agent.find_relevant_chats(
@@ -246,8 +278,6 @@ class WarmupScheduler:
                     logger.info(f"✅ Added {len(new_chats)} new chats")
                 except Exception as e:
                     logger.error(f"Error finding chats: {e}")
-            else:
-                logger.info(f"✅ {len(relevant_chats)} chats already available")
             
             # 4. Сгенерировать план действий
             logger.info("🎬 Generating action plan...")

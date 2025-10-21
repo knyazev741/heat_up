@@ -368,13 +368,23 @@ async def add_account_endpoint(request: AddAccountRequest):
         Account information with persona and discovered chats
     """
     try:
+        logger.info(f"Adding new account: {request.session_id}")
+        
+        # 0. БЫСТРАЯ проверка дубликата ДО генерации персоны
+        existing = get_account(request.session_id)
+        if existing:
+            error_msg = (
+                f"Session ID '{request.session_id}' already exists in database "
+                f"(Account ID: {existing['id']}, Phone: {existing['phone_number']})"
+            )
+            logger.warning(f"Duplicate session_id: {error_msg}")
+            raise HTTPException(status_code=409, detail=error_msg)
+        
         # Generate fake phone number if not provided
         import random
         phone_number = request.phone_number or f"+7{random.randint(9000000000, 9999999999)}"
         
-        logger.info(f"Adding new account: {request.session_id}")
-        
-        # 1. Generate persona first
+        # 1. Generate persona (только для новых аккаунтов)
         logger.info("Step 1: Generating persona...")
         persona_data = await persona_agent.generate_persona(
             phone_number,
@@ -394,15 +404,20 @@ async def add_account_endpoint(request: AddAccountRequest):
         
         # 3. Add account to DB
         logger.info("Step 2: Adding account to database...")
-        account_id = add_account(
-            session_id=request.session_id,
-            phone_number=phone_number,
-            country=persona_data.get("country", request.country),
-            min_daily_activity=min_daily,
-            max_daily_activity=max_daily,
-            provider=request.provider,
-            proxy_id=request.proxy_id
-        )
+        try:
+            account_id = add_account(
+                session_id=request.session_id,
+                phone_number=phone_number,
+                country=persona_data.get("country", request.country),
+                min_daily_activity=min_daily,
+                max_daily_activity=max_daily,
+                provider=request.provider,
+                proxy_id=request.proxy_id
+            )
+        except ValueError as e:
+            # Session ID already exists (двойная проверка на случай race condition)
+            logger.warning(f"Duplicate session_id during insert: {str(e)}")
+            raise HTTPException(status_code=409, detail=str(e))
         
         if not account_id:
             raise HTTPException(status_code=500, detail="Failed to add account")

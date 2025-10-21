@@ -151,11 +151,10 @@ WARMUP_GUIDELINES = {
     1: {
         "description": "Новый пользователь, первый вход",
         "max_actions": 5,
-        "allowed_actions": ["update_profile", "join_channel", "view_profile", "read_messages", "idle"],
+        "allowed_actions": ["join_channel", "view_profile", "read_messages", "idle"],
         "max_joins": 2,
         "max_messages": 0,
         "recommendations": [
-            "Настроить профиль (имя, фото, био)",
             "Зайти в 1-2 интересных канала",
             "Посмотреть что там пишут",
             "Пока НИЧЕГО не писать",
@@ -163,13 +162,12 @@ WARMUP_GUIDELINES = {
         ]
     },
     2: {
-        "description": "Второй день - заполнение профиля",
+        "description": "Второй день - осторожность",
         "max_actions": 5,
-        "allowed_actions": ["update_profile", "join_channel", "read_messages", "idle", "view_profile"],
+        "allowed_actions": ["join_channel", "read_messages", "idle", "view_profile"],
         "max_joins": 1,
         "max_messages": 0,
         "recommendations": [
-            "Заполнить био (О себе)",
             "Можно вступить в 1 верифицированный канал",
             "Больше idle - показать естественное поведение",
             "Не писать сообщения"

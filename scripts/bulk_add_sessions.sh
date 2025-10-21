@@ -3,7 +3,7 @@
 # Скрипт для массового добавления сессий в систему прогрева
 # Использование: ./bulk_add_sessions.sh
 
-API_URL="http://localhost:8000"
+API_URL="http://localhost:8080"
 
 echo "=========================================="
 echo "Массовое добавление сессий в Heat Up"
@@ -15,7 +15,7 @@ if ! curl -s "$API_URL/accounts" > /dev/null 2>&1; then
     echo "❌ ОШИБКА: Сервер не запущен на $API_URL"
     echo ""
     echo "Запусти сервер:"
-    echo "  uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+    echo "  python main.py"
     echo ""
     exit 1
 fi
@@ -75,9 +75,10 @@ for (( i=1; i<=session_count; i++ )); do
         -H "Content-Type: application/json" \
         -d "$json_data")
     
-    if echo "$response" | grep -q '"account_id"'; then
-        account_id=$(echo "$response" | grep -o '"account_id":[0-9]*' | grep -o '[0-9]*')
-        echo "✅ УСПЕШНО добавлен! Account ID: $account_id"
+    if echo "$response" | grep -q '"success":true'; then
+        account_id=$(echo "$response" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+        persona_name=$(echo "$response" | grep -o '"persona_name":"[^"]*"' | cut -d'"' -f4)
+        echo "✅ УСПЕШНО добавлен! Account ID: $account_id (Персона: $persona_name)"
         ((added_count++))
     else
         echo "❌ ОШИБКА при добавлении"

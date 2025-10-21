@@ -236,12 +236,59 @@ class ActionExecutor:
         else:
             logger.info(f"💎 Premium account - skipping sponsored messages")
         
+        # ВАЖНО: Сначала проверяем существование канала через высокоуровневое API
+        logger.info(f"🔍 Checking if channel {channel_username} exists...")
+        try:
+            resolve_result = await self.telegram_client.resolve_chat(session_id, channel_username)
+            
+            if not resolve_result.get("success"):
+                error = resolve_result.get("error", "")
+                error_code = resolve_result.get("error_code", "")
+                
+                # Проверяем коды ошибок из OpenAPI
+                if error_code in ["USERNAME_NOT_OCCUPIED", "USERNAME_INVALID", "INVALID_USERNAME"]:
+                    logger.warning(f"❌ Channel {channel_username} does NOT exist ({error_code})")
+                    return {
+                        "error": f"Channel {channel_username} not found ({error_code})",
+                        "success": False,
+                        "channel_not_found": True
+                    }
+                elif error_code == "CHANNEL_INVALID":
+                    logger.warning(f"❌ Channel {channel_username} is invalid or deleted")
+                    return {
+                        "error": f"Channel {channel_username} is invalid",
+                        "success": False,
+                        "channel_not_found": True
+                    }
+                else:
+                    # Другая ошибка - логируем но продолжаем join
+                    logger.warning(f"⚠️ Error resolving {channel_username}: {error} (code: {error_code})")
+                    logger.info(f"⚠️ Will try to join anyway...")
+            else:
+                logger.info(f"✅ Channel {channel_username} exists - proceeding to join")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not verify channel existence: {e}")
+            # Продолжаем попытку join даже если проверка не удалась
+        
         # Now join the channel
         result = await self.telegram_client.join_chat(session_id, channel_username)
         
         if not result.get("error"):
             self.joined_channels.add(channel_username)
             logger.info(f"Successfully joined {channel_username}")
+            
+            # Update database - mark chat as joined
+            try:
+                from database import get_account, update_chat_joined
+                account = get_account(session_id)
+                if account:
+                    account_id = account['id']
+                    update_chat_joined(account_id, channel_username)
+                    logger.info(f"✅ Marked {channel_username} as joined in database")
+                else:
+                    logger.warning(f"Could not find account for session {session_id} to update joined status")
+            except Exception as e:
+                logger.error(f"Failed to update joined status in database: {e}")
         
         # Add sponsored ads info to result
         if sponsored_ads:
@@ -337,8 +384,60 @@ class ActionExecutor:
         else:
             logger.info(f"💎 Premium account - skipping sponsored messages")
         
-        # Get dialogs to simulate activity
-        result = await self.telegram_client.get_dialogs(session_id)
+        # РЕАЛЬНО читаем сообщения из канала (не просто get_dialogs!)
+        logger.info(f"📖 Fetching messages from {channel_username}...")
+        
+        messages_result = await self.telegram_client.get_channel_messages(
+            session_id,
+            channel_username,
+            limit=10  # Читаем последние 10 сообщений
+        )
+        
+        messages_read = 0
+        messages_texts = []
+        
+        if not messages_result.get("error"):
+            try:
+                result_data = messages_result.get("result")
+                
+                # Проверяем разные форматы ответа
+                if isinstance(result_data, dict):
+                    messages = result_data.get("messages", [])
+                elif isinstance(result_data, list):
+                    messages = result_data
+                else:
+                    messages = []
+                
+                logger.info(f"📥 Received {len(messages)} messages from {channel_username}")
+                
+                # Выводим текст каждого сообщения в логи
+                for idx, msg in enumerate(messages[:10], 1):
+                    msg_id = msg.get("id", "?")
+                    msg_text = msg.get("text", "")
+                    msg_date = msg.get("date", "")
+                    
+                    if msg_text:
+                        # Обрезаем длинные сообщения
+                        text_preview = msg_text[:200] + "..." if len(msg_text) > 200 else msg_text
+                        logger.info(f"  📬 Msg #{msg_id}: {text_preview}")
+                        messages_texts.append(text_preview)
+                        messages_read += 1
+                    else:
+                        # Сообщение без текста (возможно медиа)
+                        media_type = msg.get("media", {}).get("_", "unknown") if msg.get("media") else "no media"
+                        logger.info(f"  📷 Msg #{msg_id}: [media: {media_type}]")
+                
+                if messages_read == 0:
+                    logger.info(f"📭 No text messages found in {channel_username}")
+                else:
+                    logger.info(f"✅ Read {messages_read} text messages from {channel_username}")
+                    
+            except Exception as e:
+                logger.error(f"Error parsing messages: {e}")
+                messages_read = 0
+        else:
+            error_msg = messages_result.get("error", "Unknown error")
+            logger.warning(f"⚠️ Could not fetch messages from {channel_username}: {error_msg}")
         
         # Wait for the specified duration to simulate reading
         await asyncio.sleep(duration)
@@ -348,7 +447,9 @@ class ActionExecutor:
             "channel": channel_username,
             "duration": duration,
             "status": "completed",
-            "is_premium": is_premium
+            "is_premium": is_premium,
+            "messages_read": messages_read,
+            "messages_preview": messages_texts[:3] if messages_texts else []  # First 3 messages
         }
         
         if sponsored_ads:

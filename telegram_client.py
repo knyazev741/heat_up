@@ -317,6 +317,76 @@ class TelegramAPIClient:
             logger.error(f"Error getting session info: {str(e)}")
             return {"error": str(e)}
     
+    async def resolve_username(self, session_id: str, username: str) -> Dict[str, Any]:
+        """
+        Resolve username to check if it exists and get channel/user info
+        
+        Args:
+            session_id: Telegram session UID
+            username: Username to resolve (with or without @)
+            
+        Returns:
+            API response with peer info or error
+        """
+        from telegram_tl_helpers import make_resolve_username_query
+        
+        username = username.lstrip('@')
+        logger.debug(f"Resolving username @{username}")
+        
+        query = make_resolve_username_query(username)
+        return await self.invoke_raw(session_id, query)
+    
+    async def resolve_chat(self, session_id: str, chat_username: str) -> Dict[str, Any]:
+        """
+        Resolve chat using high-level API (more reliable than low-level TL)
+        
+        Args:
+            session_id: Telegram session UID  
+            chat_username: Chat username (with or without @)
+            
+        Returns:
+            API response with chat info or error
+        """
+        # Используем высокоуровневое API из OpenAPI (надежнее чем TL invoke)
+        url = f"{self.base_url}/api/external/chats/resolve"
+        payload = {
+            "chat": chat_username,  # @ будет удален автоматически на сервере
+            "session_id": int(session_id),
+            "join_invite_link": False,  # НЕ вступать, только проверить
+            "collect_extra_analytics": False,
+            "timeout": 15,
+            "max_attempts": 2
+        }
+        
+        logger.info(f"🔍 Resolving chat {chat_username} using high-level API")
+        
+        try:
+            response = await self.client.post(
+                url,
+                json=payload,
+                headers=self._get_headers(),
+                timeout=20.0
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+            # Проверяем результат
+            if result.get("success"):
+                logger.info(f"✅ Chat {chat_username} exists and is accessible")
+                return {"success": True, "result": result}
+            else:
+                error = result.get("error", "Unknown error")
+                error_code = result.get("error_code", "")
+                logger.warning(f"⚠️ Chat {chat_username} resolve failed: {error} (code: {error_code})")
+                return {"success": False, "error": error, "error_code": error_code}
+                
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ HTTP error resolving {chat_username}: {e.response.text}")
+            return {"success": False, "error": str(e), "status_code": e.response.status_code}
+        except Exception as e:
+            logger.error(f"❌ Error resolving {chat_username}: {str(e)}")
+            return {"success": False, "error": str(e)}
+    
     async def get_sponsored_messages(
         self,
         session_id: str,

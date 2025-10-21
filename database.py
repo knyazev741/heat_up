@@ -431,8 +431,19 @@ def add_account(
         
     Returns:
         Account ID or None if failed
+        
+    Raises:
+        ValueError: If session_id already exists
     """
     try:
+        # Check if session_id already exists
+        existing = get_account(session_id)
+        if existing:
+            raise ValueError(
+                f"Session ID '{session_id}' already exists in database "
+                f"(Account ID: {existing['id']}, Phone: {existing['phone_number']})"
+            )
+        
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -458,6 +469,9 @@ def add_account(
             account_id = cursor.lastrowid
             logger.info(f"Added account {session_id} with ID {account_id}")
             return account_id
+    except ValueError:
+        # Re-raise ValueError with informative message
+        raise
     except Exception as e:
         logger.error(f"Error adding account: {e}")
         return None
@@ -739,6 +753,26 @@ def save_persona(account_id: int, persona_data: Dict[str, Any]) -> Optional[int]
     except Exception as e:
         logger.error(f"Error saving persona: {e}")
         return None
+
+
+def get_all_used_names() -> List[str]:
+    """
+    Get list of all already used persona names
+    
+    Returns:
+        List of used names (e.g. ["Иван Петров", "Мария Смирнова"])
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT generated_name FROM personas WHERE generated_name IS NOT NULL"
+            )
+            rows = cursor.fetchall()
+            return [row[0] for row in rows if row[0]]
+    except Exception as e:
+        logger.error(f"Error getting used names: {e}")
+        return []
 
 
 def get_persona(account_id: int) -> Optional[Dict[str, Any]]:
