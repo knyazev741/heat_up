@@ -66,8 +66,9 @@ class ActionPlannerAgent:
         if relevant_chats:
             channels_list = "\n".join([
                 f"- {ch['chat_username']}: {ch.get('chat_title', 'Unknown')} "
+                f"[{(ch.get('chat_type') or 'unknown').upper()}] "
                 f"{'[ВСТУПИЛ ✅]' if ch.get('is_joined') else '[НОВЫЙ]'} "
-                f"(релевантность: {ch.get('relevance_score', 0):.1f}) - {ch.get('relevance_reason', '')[:80]}" 
+                f"(релевантность: {ch.get('relevance_score', 0):.1f}) - {ch.get('relevance_reason', '')[:80]}"
                 for ch in relevant_chats[:15]
             ])
             logger.info(f"✅ Using {len(relevant_chats[:15])} RELEVANT chats from discovered_chats")
@@ -257,7 +258,7 @@ class ActionPlannerAgent:
         
         # Остальные действия - всегда доступны
         actions_list.append(f"""
-{action_num}. join_channel:
+{action_num}. join_channel (join_chat):
    {{"action": "join_channel", "channel_username": "@example", "reason": "Интересная тематика"}}""")
         action_num += 1
         
@@ -273,7 +274,7 @@ class ActionPlannerAgent:
         
         actions_list.append(f"""
 {action_num}. view_profile:
-   {{"action": "view_profile", "channel_username": "@example", "duration_seconds": 5, "reason": "Изучаю канал"}}""")
+   {{"action": "view_profile", "channel_username": "@example", "duration_seconds": 5, "reason": "Изучаю чат/канал"}}""")
         
         basic_actions = "\n".join(actions_list)
         
@@ -287,19 +288,19 @@ class ActionPlannerAgent:
 
 Твоя задача - сгенерировать реалистичную последовательность действий, которые ты бы совершил в Telegram СЕГОДНЯ.
 
-📋 ДОСТУПНЫЕ КАНАЛЫ (подобраны СПЕЦИАЛЬНО для ТВОИХ интересов):
+📋 ДОСТУПНЫЕ ЧАТЫ/КАНАЛЫ (подобраны СПЕЦИАЛЬНО для ТВОИХ интересов):
 {channels_list}
 
 ⚠️ КРИТИЧЕСКИ ВАЖНО:
-- Используй ТОЛЬКО каналы из списка выше!
-- Выбирай каналы с ВЫСОКОЙ релевантностью (>0.7) в первую очередь
+- Используй ТОЛЬКО чаты/каналы из списка выше!
+- Выбирай варианты с ВЫСОКОЙ релевантностью (>0.7) в первую очередь
 - НЕ используй @telegram или @durov - это слишком очевидно
-- Каждый человек вступает в РАЗНЫЕ каналы, соответствующие СВОИМ интересам!
+- Каждый человек вступает в РАЗНЫЕ чаты/каналы, соответствующие СВОИМ интересам!
 
 🔴 ПОНИМАНИЕ МЕТОК:
-- [ВСТУПИЛ ✅] - ты УЖЕ вступил в этот канал! Можешь ЧИТАТЬ сообщения (read_messages) или ставить реакции
+- [ВСТУПИЛ ✅] - ты УЖЕ вступил в этот чат/канал! Можешь ЧИТАТЬ сообщения (read_messages) или ставить реакции
 - [НОВЫЙ] - ты ЕЩЁ НЕ вступил! Сначала нужно ВСТУПИТЬ (join_channel), потом читать
-- НЕ пытайся читать сообщения в каналах, в которые ты не вступил!
+- НЕ пытайся читать сообщения там, где ты ещё не вступил!
 
 🤖 Доступные боты:
 {bots_list}
@@ -311,7 +312,7 @@ class ActionPlannerAgent:
 
 ПРОДВИНУТЫЕ ДЕЙСТВИЯ (доступны с определенных стадий):
 6. "react_to_message" - Поставить реакцию на сообщение
-   - Params: channel_username
+   - Params: channel_username (или chat_username)
    - Доступно со стадии 5+
    
 7. "message_bot" - Написать боту
@@ -507,13 +508,20 @@ class ActionPlannerAgent:
                 
                 validated.append(action)
                     
-            elif action_type == "join_channel":
-                if "channel_username" in action:
+            elif action_type in {"join_channel", "join_chat"}:
+                username = action.get("chat_username") or action.get("channel_username")
+                if username:
+                    action["chat_username"] = username
+                    action["channel_username"] = username
+                    action["action"] = "join_channel"
                     validated.append(action)
-                    
-            elif action_type == "read_messages":
-                if "channel_username" in action and "duration_seconds" in action:
-                    # Cap duration at reasonable limits
+
+            elif action_type in {"read_messages", "read_chat_messages"}:
+                username = action.get("chat_username") or action.get("channel_username")
+                if username and "duration_seconds" in action:
+                    action["chat_username"] = username
+                    action["channel_username"] = username
+                    action["action"] = "read_messages"
                     action["duration_seconds"] = min(20, max(3, action["duration_seconds"]))
                     validated.append(action)
                     
@@ -524,7 +532,10 @@ class ActionPlannerAgent:
                     validated.append(action)
                     
             elif action_type == "react_to_message":
-                if "channel_username" in action:
+                username = action.get("chat_username") or action.get("channel_username")
+                if username:
+                    action["chat_username"] = username
+                    action["channel_username"] = username
                     # Emoji is optional - system will pick one automatically
                     # Remove emoji if LLM provided it (we don't use it anymore)
                     if "emoji" in action:
@@ -538,8 +549,10 @@ class ActionPlannerAgent:
                     validated.append(action)
                     
             elif action_type == "view_profile":
-                if "channel_username" in action:
-                    # Add duration if missing
+                username = action.get("chat_username") or action.get("channel_username")
+                if username:
+                    action["chat_username"] = username
+                    action["channel_username"] = username
                     if "duration_seconds" not in action:
                         action["duration_seconds"] = 5
                     action["duration_seconds"] = min(8, max(3, action["duration_seconds"]))

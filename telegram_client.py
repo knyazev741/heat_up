@@ -5,6 +5,12 @@ from config import settings
 from telegram_tl_helpers import (
     make_get_dialogs_query,
     make_resolve_username_query,
+    make_get_history_query,
+    make_input_peer_channel,
+    make_input_peer_user,
+    make_input_peer_chat,
+    make_get_peer_dialogs_query,
+    make_read_history_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -386,7 +392,277 @@ class TelegramAPIClient:
         except Exception as e:
             logger.error(f"❌ Error resolving {chat_username}: {str(e)}")
             return {"success": False, "error": str(e)}
-    
+
+    def _extract_resolve_payload(self, response: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Extract contacts.ResolvedPeer payload from invoke response"""
+
+        if not isinstance(response, dict):
+            return None
+
+        result = response.get("result")
+
+        if isinstance(result, dict) and "peer" in result:
+            return result
+
+        # Sometimes result is wrapped under another "result" key
+        if isinstance(result, dict) and "result" in result and isinstance(result["result"], dict):
+            nested = result["result"]
+            if "peer" in nested:
+                return nested
+
+        return None
+
+    def _build_peer_info(self, payload: Dict[str, Any], username: str) -> Dict[str, Any]:
+        """Convert contacts.ResolvedPeer payload into convenient structure"""
+
+        peer = payload.get("peer", {}) or {}
+        peer_type = peer.get("_") or ""
+
+        info: Dict[str, Any] = {
+            "peer_raw": peer,
+            "username": username.lstrip('@'),
+            "raw_payload": payload
+        }
+
+        if "PeerChannel" in peer_type:
+            channel_id = peer.get("channel_id")
+            channel_data = None
+            for chat in payload.get("chats", []):
+                if chat.get("id") == channel_id:
+                    channel_data = chat
+                    break
+
+            if not channel_data:
+                raise ValueError("Channel data missing in resolve response")
+
+            access_hash = channel_data.get("access_hash")
+            if access_hash is None:
+                raise ValueError("Channel access_hash missing in resolve response")
+
+            input_peer = make_input_peer_channel(channel_id, access_hash)
+            chat_type = channel_data.get("type") or "channel"
+            if channel_data.get("megagroup"):
+                chat_type = "supergroup"
+            elif channel_data.get("broadcast"):
+                chat_type = "channel"
+
+            members_count = (
+                channel_data.get("participants_count")
+                or channel_data.get("participant_count")
+                or channel_data.get("members_count")
+            )
+
+            info.update({
+                "peer_type": "channel",
+                "peer_id": channel_id,
+                "access_hash": access_hash,
+                "input_peer": input_peer,
+                "chat_type": chat_type,
+                "chat_data": channel_data,
+                "title": channel_data.get("title"),
+                "members_count": members_count
+            })
+
+        elif "PeerChat" in peer_type:
+            chat_id = peer.get("chat_id")
+            chat_data = None
+            for chat in payload.get("chats", []):
+                if chat.get("id") == chat_id:
+                    chat_data = chat
+                    break
+
+            input_peer = make_input_peer_chat(chat_id)
+
+            members_count = (
+                (chat_data or {}).get("participants_count")
+                or (chat_data or {}).get("participant_count")
+                or (chat_data or {}).get("members_count")
+            )
+
+            info.update({
+                "peer_type": "chat",
+                "peer_id": chat_id,
+                "input_peer": input_peer,
+                "chat_type": (chat_data or {}).get("type") or "group",
+                "chat_data": chat_data or {},
+                "title": (chat_data or {}).get("title"),
+                "members_count": members_count
+            })
+
+        elif "PeerUser" in peer_type:
+            user_id = peer.get("user_id")
+            user_data = None
+            for user in payload.get("users", []):
+                if user.get("id") == user_id:
+                    user_data = user
+                    break
+
+            if not user_data:
+                raise ValueError("User data missing in resolve response")
+
+            access_hash = user_data.get("access_hash")
+            if access_hash is None:
+                raise ValueError("User access_hash missing in resolve response")
+
+            input_peer = make_input_peer_user(user_id, access_hash)
+
+            info.update({
+                "peer_type": "user",
+                "peer_id": user_id,
+                "access_hash": access_hash,
+                "input_peer": input_peer,
+                "user_data": user_data,
+                "title": f"{user_data.get('first_name', '')} {user_data.get('last_name', '')}".strip(),
+                "chat_type": "private"
+            })
+
+        else:
+            raise ValueError(f"Unsupported peer type: {peer_type}")
+
+        return info
+
+    async def resolve_peer(self, session_id: str, chat_username: str) -> Dict[str, Any]:
+        """Resolve username and build InputPeer information"""
+
+        response = await self.resolve_username(session_id, chat_username)
+
+        if response.get("error") and not response.get("result"):
+            return {"success": False, "error": response.get("error")}
+
+        payload = self._extract_resolve_payload(response)
+
+        if not payload:
+            error_msg = response.get("error") or "Failed to parse resolve response"
+            return {"success": False, "error": error_msg}
+
+        try:
+            info = self._build_peer_info(payload, chat_username)
+            info["success"] = True
+            return info
+        except ValueError as exc:
+            logger.error(f"Failed to build peer info for {chat_username}: {exc}")
+            return {"success": False, "error": str(exc)}
+
+    def _find_matching_dialog(
+        self,
+        dialogs_result: Dict[str, Any],
+        peer_info: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Find dialog entry matching the resolved peer"""
+
+        if not isinstance(dialogs_result, dict):
+            return None
+
+        dialogs = dialogs_result.get("dialogs")
+        if not isinstance(dialogs, list):
+            return None
+
+        target_type = peer_info.get("peer_type")
+        target_id = peer_info.get("peer_id")
+
+        for dialog in dialogs:
+            if not isinstance(dialog, dict):
+                continue
+
+            peer = dialog.get("peer") or {}
+            if not isinstance(peer, dict):
+                continue
+
+            if target_type == "channel" and peer.get("channel_id") == target_id:
+                return dialog
+            if target_type == "chat" and peer.get("chat_id") == target_id:
+                return dialog
+            if target_type == "user" and peer.get("user_id") == target_id:
+                return dialog
+
+        return None
+
+    async def get_peer_dialog(
+        self,
+        session_id: str,
+        peer_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Fetch dialog information for specific peer"""
+
+        input_peer = peer_info.get("input_peer")
+        if input_peer is None:
+            return {"success": False, "error": "Missing input peer"}
+
+        query = make_get_peer_dialogs_query(input_peer)
+        response = await self.invoke_raw(session_id, query)
+
+        if response.get("error"):
+            logger.warning(f"GetPeerDialogs failed: {response.get('error')}")
+        else:
+            result_payload = response.get("result")
+            dialog = self._find_matching_dialog(result_payload, peer_info)
+            if dialog:
+                return {
+                    "success": True,
+                    "dialog": dialog,
+                    "unread_count": dialog.get("unread_count", 0),
+                    "top_message": dialog.get("top_message"),
+                    "read_inbox_max_id": dialog.get("read_inbox_max_id"),
+                    "result": result_payload
+                }
+
+        # Fallback to GetDialogs (may return many entries but ensures coverage)
+        dialogs_response = await self.get_dialogs(session_id, limit=100)
+        fallback_payload = dialogs_response.get("result") if isinstance(dialogs_response, dict) else {}
+        dialog = self._find_matching_dialog(fallback_payload, peer_info)
+        if dialog:
+            return {
+                "success": True,
+                "dialog": dialog,
+                "unread_count": dialog.get("unread_count", 0),
+                "top_message": dialog.get("top_message"),
+                "read_inbox_max_id": dialog.get("read_inbox_max_id"),
+                "result": fallback_payload
+            }
+
+        return {"success": False, "error": "Dialog not found", "result": fallback_payload}
+
+    async def get_chat_history(
+        self,
+        session_id: str,
+        peer_info: Dict[str, Any],
+        limit: int = 20
+    ) -> Dict[str, Any]:
+        """Fetch chat history using raw GetHistory TL method"""
+
+        input_peer = peer_info.get("input_peer")
+        if input_peer is None:
+            return {"success": False, "error": "Missing input peer"}
+
+        query = make_get_history_query(
+            peer=input_peer,
+            limit=limit
+        )
+
+        return await self.invoke_raw(session_id, query)
+
+    async def mark_history_read(
+        self,
+        session_id: str,
+        peer_info: Dict[str, Any],
+        max_id: int
+    ) -> Dict[str, Any]:
+        """Mark chat history as read up to specified message id"""
+
+        if max_id <= 0:
+            return {"success": False, "error": "Invalid max_id"}
+
+        input_peer = peer_info.get("input_peer")
+        if input_peer is None:
+            return {"success": False, "error": "Missing input peer"}
+
+        query = make_read_history_query(
+            peer=input_peer,
+            max_id=max_id
+        )
+
+        return await self.invoke_raw(session_id, query)
+
     async def get_sponsored_messages(
         self,
         session_id: str,

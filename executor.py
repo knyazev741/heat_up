@@ -127,9 +127,9 @@ class ActionExecutor:
             logger.warning(f"Skipping {action_type} due to FloodWait cooldown")
             return {"error": "Session in FloodWait cooldown", "skipped": True}
         
-        if action_type == "join_channel":
+        if action_type in {"join_channel", "join_chat"}:
             return await self._join_channel(session_id, action)
-        elif action_type == "read_messages":
+        elif action_type in {"read_messages", "read_chat_messages"}:
             return await self._read_messages(session_id, action)
         elif action_type == "idle":
             return await self._idle(session_id, action)
@@ -156,41 +156,82 @@ class ActionExecutor:
     
     async def _join_channel(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Join a channel
-        
+        Join a chat or channel.
+
         According to Telegram's custom client guidelines, we must request
         and display sponsored messages for non-premium users when opening channels/bots.
         """
-        channel_username = action.get("channel_username")
-        
-        if not channel_username:
-            return {"error": "Missing channel_username"}
-        
+        chat_username = action.get("chat_username") or action.get("channel_username")
+        if not chat_username:
+            return {"error": "Missing chat_username"}
+
+        chat_type = (action.get("chat_type") or "").lower()
+        logger.info(f"🚪 Attempting to join {chat_username} (type: {chat_type or 'unknown'})")
+
         # Check if user has premium (required by Telegram guidelines)
         session_info = await self.telegram_client.get_session_info(session_id)
         is_premium = False
-        
+
         if not session_info.get("error"):
             is_premium = session_info.get("is_premium", False)
             logger.info(f"📱 Session {session_id} premium status: {is_premium}")
-        
-        # Get sponsored messages if not premium (Telegram requirement for opening channel)
+        else:
+            logger.warning(f"⚠️ Could not determine premium status: {session_info.get('error')}")
+
+        # Проверяем существование чата через высокоуровневое API
+        resolved_chat: Dict[str, Any] = {}
+        logger.info(f"🔍 Checking if chat {chat_username} exists...")
+        try:
+            resolve_result = await self.telegram_client.resolve_chat(session_id, chat_username)
+
+            if resolve_result.get("success"):
+                resolved_chat = resolve_result.get("result", {}).get("chat") or {}
+                if isinstance(resolved_chat, dict) and resolved_chat.get("type"):
+                    chat_type = resolved_chat.get("type", chat_type).lower()
+                logger.info(f"✅ Chat {chat_username} exists (type: {chat_type or 'unknown'})")
+            else:
+                error = resolve_result.get("error", "")
+                error_code = resolve_result.get("error_code", "")
+
+                if error_code in ["USERNAME_NOT_OCCUPIED", "USERNAME_INVALID", "INVALID_USERNAME"]:
+                    logger.warning(f"❌ Chat {chat_username} does NOT exist ({error_code})")
+                    return {
+                        "error": f"Chat {chat_username} not found ({error_code})",
+                        "success": False,
+                        "channel_not_found": True
+                    }
+                elif error_code == "CHANNEL_INVALID":
+                    logger.warning(f"❌ Chat {chat_username} is invalid or deleted")
+                    return {
+                        "error": f"Chat {chat_username} is invalid",
+                        "success": False,
+                        "channel_not_found": True
+                    }
+                else:
+                    logger.warning(f"⚠️ Error resolving {chat_username}: {error} (code: {error_code})")
+                    logger.info("⚠️ Will try to join anyway...")
+        except Exception as exc:
+            logger.warning(f"⚠️ Could not verify chat existence: {exc}")
+
+        # Get sponsored messages if required (only for channel-like entities)
         sponsored_ads = []
-        if not is_premium:
-            logger.info(f"🎯 Non-premium account - fetching official sponsored messages before join")
-            
+        should_fetch_ads = not is_premium and chat_type not in {"group", "supergroup", "private"}
+
+        if should_fetch_ads:
+            logger.info("🎯 Non-premium account - fetching official sponsored messages before join")
+
             sponsored_result = await self.telegram_client.get_sponsored_messages(
                 session_id,
-                channel_username
+                chat_username
             )
-            
+
             if sponsored_result.get("success"):
                 result_data = sponsored_result.get("result", {})
                 messages = result_data.get("messages", [])
-                
-                if messages and len(messages) > 0:
-                    logger.info(f"📢 Found {len(messages)} sponsored message(s) for {channel_username}")
-                    
+
+                if messages:
+                    logger.info(f"📢 Found {len(messages)} sponsored message(s) for {chat_username}")
+
                     for idx, ad in enumerate(messages, 1):
                         title = ad.get("title", "")
                         message = ad.get("message", "")
@@ -198,14 +239,14 @@ class ActionExecutor:
                         button_text = ad.get("button_text", "")
                         recommended = ad.get("recommended", False)
                         random_id = ad.get("random_id")
-                        
+
                         logger.info(f"  Ad #{idx}:")
                         logger.info(f"    Title: {title}")
                         logger.info(f"    Message: {message[:100]}..." if len(message) > 100 else f"    Message: {message}")
                         logger.info(f"    URL: {url}")
                         logger.info(f"    Button: {button_text}")
                         logger.info(f"    Recommended: {recommended}")
-                        
+
                         sponsored_ads.append({
                             "title": title,
                             "message": message,
@@ -214,8 +255,7 @@ class ActionExecutor:
                             "recommended": recommended,
                             "random_id": random_id
                         })
-                        
-                        # Mark as viewed (required by Telegram guidelines)
+
                         if random_id:
                             try:
                                 await self.telegram_client.view_sponsored_message(
@@ -223,122 +263,97 @@ class ActionExecutor:
                                     random_id
                                 )
                                 logger.debug(f"    ✓ Marked ad #{idx} as viewed")
-                            except Exception as e:
-                                logger.warning(f"    ⚠ Failed to mark ad as viewed: {e}")
+                            except Exception as exc:
+                                logger.warning(f"    ⚠ Failed to mark ad as viewed: {exc}")
                 else:
-                    logger.info(f"📭 No sponsored messages available for {channel_username}")
+                    logger.info(f"📭 No sponsored messages available for {chat_username}")
             elif "AD_EXPIRED" in str(sponsored_result.get("error", "")):
-                logger.info(f"⏰ Sponsored messages expired for {channel_username}")
+                logger.info(f"⏰ Sponsored messages expired for {chat_username}")
             elif "PREMIUM_ACCOUNT_REQUIRED" in str(sponsored_result.get("error", "")):
-                logger.info(f"💎 Account is actually premium (server says so)")
+                logger.info("💎 Account is actually premium (server says so)")
             else:
                 logger.warning(f"⚠ Could not fetch sponsored messages: {sponsored_result.get('error')}")
+        elif not is_premium:
+            logger.info(f"ℹ️ Skipping sponsored ads for chat type '{chat_type or 'unknown'}'")
         else:
-            logger.info(f"💎 Premium account - skipping sponsored messages")
-        
-        # ВАЖНО: Сначала проверяем существование канала через высокоуровневое API
-        logger.info(f"🔍 Checking if channel {channel_username} exists...")
-        try:
-            resolve_result = await self.telegram_client.resolve_chat(session_id, channel_username)
-            
-            if not resolve_result.get("success"):
-                error = resolve_result.get("error", "")
-                error_code = resolve_result.get("error_code", "")
-                
-                # Проверяем коды ошибок из OpenAPI
-                if error_code in ["USERNAME_NOT_OCCUPIED", "USERNAME_INVALID", "INVALID_USERNAME"]:
-                    logger.warning(f"❌ Channel {channel_username} does NOT exist ({error_code})")
-                    return {
-                        "error": f"Channel {channel_username} not found ({error_code})",
-                        "success": False,
-                        "channel_not_found": True
-                    }
-                elif error_code == "CHANNEL_INVALID":
-                    logger.warning(f"❌ Channel {channel_username} is invalid or deleted")
-                    return {
-                        "error": f"Channel {channel_username} is invalid",
-                        "success": False,
-                        "channel_not_found": True
-                    }
-                else:
-                    # Другая ошибка - логируем но продолжаем join
-                    logger.warning(f"⚠️ Error resolving {channel_username}: {error} (code: {error_code})")
-                    logger.info(f"⚠️ Will try to join anyway...")
-            else:
-                logger.info(f"✅ Channel {channel_username} exists - proceeding to join")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not verify channel existence: {e}")
-            # Продолжаем попытку join даже если проверка не удалась
-        
-        # Now join the channel
-        result = await self.telegram_client.join_chat(session_id, channel_username)
-        
+            logger.info("💎 Premium account - skipping sponsored messages")
+
+        # Now join the chat
+        result = await self.telegram_client.join_chat(session_id, chat_username)
+
         if not result.get("error"):
-            self.joined_channels.add(channel_username)
-            logger.info(f"Successfully joined {channel_username}")
-            
+            self.joined_channels.add(chat_username)
+            logger.info(f"Successfully joined {chat_username}")
+
             # Update database - mark chat as joined
             try:
                 from database import get_account, update_chat_joined
                 account = get_account(session_id)
                 if account:
                     account_id = account['id']
-                    update_chat_joined(account_id, channel_username)
-                    logger.info(f"✅ Marked {channel_username} as joined in database")
+                    update_chat_joined(account_id, chat_username)
+                    logger.info(f"✅ Marked {chat_username} as joined in database")
                 else:
                     logger.warning(f"Could not find account for session {session_id} to update joined status")
-            except Exception as e:
-                logger.error(f"Failed to update joined status in database: {e}")
-        
+            except Exception as exc:
+                logger.error(f"Failed to update joined status in database: {exc}")
+
         # Add sponsored ads info to result
         if sponsored_ads:
             result["sponsored_ads_count"] = len(sponsored_ads)
             result["sponsored_ads"] = sponsored_ads
-        
+
         result["is_premium"] = is_premium
-        
+        if chat_type:
+            result["chat_type"] = chat_type
+        if resolved_chat:
+            result["chat_meta"] = resolved_chat
+
         return result
-    
+
     async def _read_messages(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Simulate reading messages in a channel
-        
-        According to Telegram's custom client guidelines, we must request
-        and display sponsored messages for non-premium users when opening channels/bots.
-        """
-        channel_username = action.get("channel_username")
+        Read messages in a chat or channel and report unread counts"""
+        chat_username = action.get("chat_username") or action.get("channel_username")
         duration = action.get("duration_seconds", 5)
-        
-        if not channel_username:
-            return {"error": "Missing channel_username"}
-        
-        logger.info(f"Reading messages in {channel_username} for {duration}s")
-        
-        # Check if user has premium (required by Telegram guidelines)
+
+        if not chat_username:
+            return {"error": "Missing chat_username"}
+
+        logger.info(f"Reading messages in {chat_username} for {duration}s")
+
         session_info = await self.telegram_client.get_session_info(session_id)
         is_premium = False
-        
+
         if not session_info.get("error"):
             is_premium = session_info.get("is_premium", False)
             logger.info(f"📱 Session {session_id} premium status: {is_premium}")
-        
-        # Get sponsored messages if not premium (Telegram requirement)
+        else:
+            logger.warning(f"⚠️ Could not determine premium status: {session_info.get('error')}")
+
+        resolved_peer = await self.telegram_client.resolve_peer(session_id, chat_username)
+        if not resolved_peer.get("success"):
+            error_msg = resolved_peer.get("error", "Failed to resolve chat")
+            logger.error(f"❌ Cannot resolve chat {chat_username}: {error_msg}")
+            return {"error": error_msg, "success": False}
+
+        chat_type = (action.get("chat_type") or resolved_peer.get("chat_type") or resolved_peer.get("peer_type") or "").lower()
         sponsored_ads = []
-        if not is_premium:
-            logger.info(f"🎯 Non-premium account - fetching official sponsored messages")
-            
+        should_fetch_ads = not is_premium and chat_type not in {"group", "supergroup", "private"}
+
+        if should_fetch_ads:
+            logger.info("🎯 Non-premium account - fetching official sponsored messages before reading")
             sponsored_result = await self.telegram_client.get_sponsored_messages(
                 session_id,
-                channel_username
+                chat_username
             )
-            
+
             if sponsored_result.get("success"):
                 result_data = sponsored_result.get("result", {})
                 messages = result_data.get("messages", [])
-                
-                if messages and len(messages) > 0:
-                    logger.info(f"📢 Found {len(messages)} sponsored message(s) for {channel_username}")
-                    
+
+                if messages:
+                    logger.info(f"📢 Found {len(messages)} sponsored message(s) for {chat_username}")
                     for idx, ad in enumerate(messages, 1):
                         title = ad.get("title", "")
                         message = ad.get("message", "")
@@ -346,14 +361,14 @@ class ActionExecutor:
                         button_text = ad.get("button_text", "")
                         recommended = ad.get("recommended", False)
                         random_id = ad.get("random_id")
-                        
+
                         logger.info(f"  Ad #{idx}:")
                         logger.info(f"    Title: {title}")
                         logger.info(f"    Message: {message[:100]}..." if len(message) > 100 else f"    Message: {message}")
                         logger.info(f"    URL: {url}")
                         logger.info(f"    Button: {button_text}")
                         logger.info(f"    Recommended: {recommended}")
-                        
+
                         sponsored_ads.append({
                             "title": title,
                             "message": message,
@@ -362,102 +377,109 @@ class ActionExecutor:
                             "recommended": recommended,
                             "random_id": random_id
                         })
-                        
-                        # Mark as viewed (required by Telegram guidelines)
+
                         if random_id:
                             try:
-                                await self.telegram_client.view_sponsored_message(
-                                    session_id,
-                                    random_id
-                                )
+                                await self.telegram_client.view_sponsored_message(session_id, random_id)
                                 logger.debug(f"    ✓ Marked ad #{idx} as viewed")
-                            except Exception as e:
-                                logger.warning(f"    ⚠ Failed to mark ad as viewed: {e}")
+                            except Exception as exc:
+                                logger.warning(f"    ⚠ Failed to mark ad as viewed: {exc}")
                 else:
-                    logger.info(f"📭 No sponsored messages available for {channel_username}")
+                    logger.info(f"📭 No sponsored messages available for {chat_username}")
             elif "AD_EXPIRED" in str(sponsored_result.get("error", "")):
-                logger.info(f"⏰ Sponsored messages expired for {channel_username}")
+                logger.info(f"⏰ Sponsored messages expired for {chat_username}")
             elif "PREMIUM_ACCOUNT_REQUIRED" in str(sponsored_result.get("error", "")):
-                logger.info(f"💎 Account is actually premium (server says so)")
+                logger.info("💎 Account is actually premium (server says so)")
             else:
                 logger.warning(f"⚠ Could not fetch sponsored messages: {sponsored_result.get('error')}")
+        elif not is_premium:
+            logger.info(f"ℹ️ Skipping sponsored ads for chat type '{chat_type or 'unknown'}'")
         else:
-            logger.info(f"💎 Premium account - skipping sponsored messages")
-        
-        # РЕАЛЬНО читаем сообщения из канала (не просто get_dialogs!)
-        logger.info(f"📖 Fetching messages from {channel_username}...")
-        
-        messages_result = await self.telegram_client.get_channel_messages(
-            session_id,
-            channel_username,
-            limit=10  # Читаем последние 10 сообщений
-        )
-        
+            logger.info("💎 Premium account - skipping sponsored messages")
+
+        unread_count = None
+        dialog_info = await self.telegram_client.get_peer_dialog(session_id, resolved_peer)
+        if dialog_info.get("success"):
+            unread_count = dialog_info.get("unread_count", 0)
+            logger.info(f"📨 Unread messages in {chat_username}: {unread_count}")
+        else:
+            logger.warning(f"⚠️ Could not get dialog info for {chat_username}: {dialog_info.get('error')}")
+
+        history_result = await self.telegram_client.get_chat_history(session_id, resolved_peer, limit=10)
         messages_read = 0
         messages_texts = []
-        
-        if not messages_result.get("error"):
+        last_message_id = 0
+
+        if not history_result.get("error"):
             try:
-                result_data = messages_result.get("result")
-                
-                # Проверяем разные форматы ответа
+                result_data = history_result.get("result") or {}
                 if isinstance(result_data, dict):
                     messages = result_data.get("messages", [])
                 elif isinstance(result_data, list):
                     messages = result_data
                 else:
                     messages = []
-                
-                logger.info(f"📥 Received {len(messages)} messages from {channel_username}")
-                
-                # Выводим текст каждого сообщения в логи
-                for idx, msg in enumerate(messages[:10], 1):
-                    msg_id = msg.get("id", "?")
-                    msg_text = msg.get("text", "")
-                    msg_date = msg.get("date", "")
-                    
+
+                logger.info(f"📥 Received {len(messages)} messages from {chat_username}")
+
+                for msg in messages[:10]:
+                    msg_id = msg.get("id")
+                    if isinstance(msg_id, int):
+                        last_message_id = max(last_message_id, msg_id)
+                    msg_text = msg.get("message") or msg.get("text", "")
                     if msg_text:
-                        # Обрезаем длинные сообщения
                         text_preview = msg_text[:200] + "..." if len(msg_text) > 200 else msg_text
-                        logger.info(f"  📬 Msg #{msg_id}: {text_preview}")
+                        logger.info(f"  📬 Msg #{msg.get('id', '?')}: {text_preview}")
                         messages_texts.append(text_preview)
                         messages_read += 1
                     else:
-                        # Сообщение без текста (возможно медиа)
                         media_type = msg.get("media", {}).get("_", "unknown") if msg.get("media") else "no media"
-                        logger.info(f"  📷 Msg #{msg_id}: [media: {media_type}]")
-                
+                        logger.info(f"  📷 Msg #{msg.get('id', '?')}: [media: {media_type}]")
+
                 if messages_read == 0:
-                    logger.info(f"📭 No text messages found in {channel_username}")
+                    logger.info(f"📭 No text messages found in {chat_username}")
                 else:
-                    logger.info(f"✅ Read {messages_read} text messages from {channel_username}")
-                    
-            except Exception as e:
-                logger.error(f"Error parsing messages: {e}")
+                    logger.info(f"✅ Read {messages_read} text messages from {chat_username}")
+            except Exception as exc:
+                logger.error(f"Error parsing messages: {exc}")
                 messages_read = 0
         else:
-            error_msg = messages_result.get("error", "Unknown error")
-            logger.warning(f"⚠️ Could not fetch messages from {channel_username}: {error_msg}")
-        
-        # Wait for the specified duration to simulate reading
+            error_msg = history_result.get("error", "Unknown error")
+            logger.warning(f"⚠️ Could not fetch messages from {chat_username}: {error_msg}")
+
+        marked_read = False
+        if unread_count and unread_count > 0 and last_message_id:
+            mark_result = await self.telegram_client.mark_history_read(session_id, resolved_peer, max_id=last_message_id)
+            if not mark_result.get("error"):
+                marked_read = True
+                logger.info(f"👁️ Marked messages up to #{last_message_id} as read in {chat_username}")
+            else:
+                logger.warning(f"⚠️ Failed to mark history as read: {mark_result.get('error')}")
+
         await asyncio.sleep(duration)
-        
+
         response = {
             "action": "read_messages",
-            "channel": channel_username,
+            "chat": chat_username,
+            "chat_type": chat_type or None,
             "duration": duration,
             "status": "completed",
             "is_premium": is_premium,
+            "unread_count_before": unread_count,
             "messages_read": messages_read,
-            "messages_preview": messages_texts[:3] if messages_texts else []  # First 3 messages
+            "messages_preview": messages_texts[:3] if messages_texts else []
         }
-        
+        response["channel"] = chat_username  # backward compatibility
+
         if sponsored_ads:
             response["sponsored_ads_count"] = len(sponsored_ads)
             response["sponsored_ads"] = sponsored_ads
-        
+
+        if marked_read:
+            response["marked_read"] = True
+
         return response
-    
+
     async def _idle(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
         """Simulate idle/break time"""
         duration = action.get("duration_seconds", 5)

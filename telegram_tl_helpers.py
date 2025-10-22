@@ -174,6 +174,49 @@ def make_input_peer_user(user_id: int, access_hash: int) -> pylogram.raw.types.I
     )
 
 
+def make_input_peer_chat(chat_id: int) -> pylogram.raw.types.InputPeerChat:
+    """Create InputPeerChat"""
+    return pylogram.raw.types.InputPeerChat(
+        chat_id=chat_id
+    )
+
+
+def make_input_dialog_peer(
+    peer: pylogram.raw.base.input_peer.InputPeer
+) -> pylogram.raw.types.InputDialogPeer:
+    """Wrap InputPeer into InputDialogPeer"""
+    return pylogram.raw.types.InputDialogPeer(
+        peer=peer
+    )
+
+
+def make_get_peer_dialogs_query(
+    peer: pylogram.raw.base.input_peer.InputPeer
+) -> str:
+    """Create GetPeerDialogs query for a specific peer"""
+
+    dialog_peer = make_input_dialog_peer(peer)
+    raw_method = pylogram.raw.functions.messages.GetPeerDialogs(
+        peers=[dialog_peer]
+    )
+
+    return raw_method_to_string(raw_method)
+
+
+def make_read_history_query(
+    peer: pylogram.raw.base.input_peer.InputPeer,
+    max_id: int = 0
+) -> str:
+    """Create ReadHistory query to mark messages as read up to max_id"""
+
+    raw_method = pylogram.raw.functions.messages.ReadHistory(
+        peer=peer,
+        max_id=max_id
+    )
+
+    return raw_method_to_string(raw_method)
+
+
 def make_update_profile_query(
     first_name: str = None,
     last_name: str = None,
