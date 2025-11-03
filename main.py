@@ -187,8 +187,19 @@ async def warmup_session(
     
     try:
         # Get account and persona data
-        from database import get_account, get_persona
+        from database import get_account, get_persona, should_skip_warmup
         account_data = get_account(session_id)
+        
+        # Проверить, нужно ли пропустить эту сессию
+        if account_data:
+            should_skip, skip_reason = should_skip_warmup(account_data)
+            if should_skip:
+                logger.warning(f"⚠️ REJECTING warmup request for session {session_id}: {skip_reason}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot warmup session: {skip_reason}. This session is excluded to save LLM tokens."
+                )
+        
         persona_data = None
         
         if account_data and account_data.get('id'):
@@ -262,8 +273,19 @@ async def warmup_session_sync(
     
     try:
         # Get account and persona data
-        from database import get_account, get_persona
+        from database import get_account, get_persona, should_skip_warmup
         account_data = get_account(session_id)
+        
+        # Проверить, нужно ли пропустить эту сессию
+        if account_data:
+            should_skip, skip_reason = should_skip_warmup(account_data)
+            if should_skip:
+                logger.warning(f"⚠️ REJECTING sync warmup request for session {session_id}: {skip_reason}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot warmup session: {skip_reason}. This session is excluded to save LLM tokens."
+                )
+        
         persona_data = None
         
         if account_data and account_data.get('id'):

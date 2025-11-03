@@ -25,7 +25,8 @@ from database import (
     save_discovered_chat,
     save_warmup_session,
     update_account,
-    update_account_stage
+    update_account_stage,
+    should_skip_warmup
 )
 
 logger = logging.getLogger(__name__)
@@ -211,6 +212,14 @@ class WarmupScheduler:
             logger.info(f"Session ID: {session_id}")
             logger.info(f"Warmup Stage: {warmup_stage}")
             logger.info(f"Phone: {account.get('phone_number', 'unknown')}")
+            
+            # 1.5. Проверить, нужно ли пропустить этот аккаунт (frozen/deleted/banned forever/LLM disabled)
+            should_skip, skip_reason = should_skip_warmup(account)
+            if should_skip:
+                logger.warning(f"⚠️ SKIPPING warmup for session {session_id}: {skip_reason}")
+                logger.warning(f"   This session will be excluded from warmup to save LLM tokens")
+                logger.info("=" * 100)
+                return
             
             # 2. Проверить/создать личность
             persona = get_persona(account_id)

@@ -28,6 +28,9 @@ class UpdateAccountRequest(BaseModel):
     warmup_stage: Optional[int] = Field(None, ge=1, le=30)
     is_frozen: Optional[bool] = None
     is_banned: Optional[bool] = None
+    is_deleted: Optional[bool] = None
+    unban_date: Optional[str] = None
+    llm_generation_disabled: Optional[bool] = None
 
 
 class AccountResponse(BaseModel):
@@ -48,6 +51,9 @@ class AccountResponse(BaseModel):
     is_active: bool
     is_frozen: bool
     is_banned: bool
+    is_deleted: bool = False
+    unban_date: Optional[str] = None
+    llm_generation_disabled: bool = False
     country: Optional[str]
     provider: Optional[str]
 

@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     deepseek_api_key: str = ""  # DeepSeek API key
     telegram_api_base_url: str = "http://localhost:8000"
     telegram_api_key: str = ""
+    admin_api_base_url: str = "https://adminapi.knyazservice.com"  # Admin API base URL
     log_level: str = "INFO"
     tgstat_api_token: str = "2539dfbdf80afd5c45d0c8f86cc9d21a"
     session_history_days: int = 30

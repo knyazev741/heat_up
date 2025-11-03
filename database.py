@@ -82,12 +82,34 @@ def init_database():
                 is_active BOOLEAN DEFAULT 1,
                 is_frozen BOOLEAN DEFAULT 0,
                 is_banned BOOLEAN DEFAULT 0,
+                is_deleted BOOLEAN DEFAULT 0,
+                unban_date DATETIME,
+                llm_generation_disabled BOOLEAN DEFAULT 0,
                 
                 country TEXT,
                 provider TEXT,
                 proxy_id INTEGER
             )
         """)
+        
+        # Migrate existing tables - add new columns if they don't exist
+        try:
+            cursor.execute("SELECT is_deleted FROM accounts LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("Adding is_deleted column to accounts table")
+            cursor.execute("ALTER TABLE accounts ADD COLUMN is_deleted BOOLEAN DEFAULT 0")
+        
+        try:
+            cursor.execute("SELECT unban_date FROM accounts LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("Adding unban_date column to accounts table")
+            cursor.execute("ALTER TABLE accounts ADD COLUMN unban_date DATETIME")
+        
+        try:
+            cursor.execute("SELECT llm_generation_disabled FROM accounts LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("Adding llm_generation_disabled column to accounts table")
+            cursor.execute("ALTER TABLE accounts ADD COLUMN llm_generation_disabled BOOLEAN DEFAULT 0")
         
         # Create personas table
         cursor.execute("""
@@ -631,12 +653,48 @@ def get_all_accounts(
         return []
 
 
+def should_skip_warmup(account: Dict[str, Any]) -> tuple[bool, str]:
+    """
+    Проверить, нужно ли пропустить прогрев сессии
+    
+    Args:
+        account: Словарь с данными аккаунта
+        
+    Returns:
+        Кортеж (should_skip: bool, reason: str)
+    """
+    # Проверка 1: Сессия удалена
+    if account.get("is_deleted"):
+        return True, "session is deleted"
+    
+    # Проверка 2: Сессия заморожена
+    if account.get("is_frozen"):
+        return True, "session is frozen"
+    
+    # Проверка 3: Бан навсегда (is_banned и нет unban_date)
+    # Временные баны (с unban_date) РАЗРЕШЕНЫ - пусть греются
+    if account.get("is_banned") and not account.get("unban_date"):
+        return True, "session is banned forever (no unban_date)"
+    
+    # Проверка 4: LLM генерация отключена вручную
+    if account.get("llm_generation_disabled"):
+        return True, "LLM generation is manually disabled for this session"
+    
+    # Проверка 5: Сессия неактивна
+    if not account.get("is_active"):
+        return True, "session is not active"
+    
+    return False, ""
+
+
 def get_accounts_for_warmup() -> List[Dict[str, Any]]:
     """
     Get accounts that need warmup right now
     
     Returns:
         List of account dicts that should be warmed up
+        (excludes deleted, frozen, banned forever, and manually disabled sessions)
+        Note: Temporarily banned sessions (with unban_date) ARE included
     """
     try:
         with get_db_connection() as conn:
@@ -644,7 +702,11 @@ def get_accounts_for_warmup() -> List[Dict[str, Any]]:
             cursor.execute(
                 """
                 SELECT * FROM accounts 
-                WHERE is_active = 1 AND is_banned = 0 AND is_frozen = 0
+                WHERE is_active = 1 
+                  AND is_deleted = 0 
+                  AND is_frozen = 0 
+                  AND llm_generation_disabled = 0
+                  AND (is_banned = 0 OR (is_banned = 1 AND unban_date IS NOT NULL))
                 ORDER BY last_warmup_date ASC NULLS FIRST
                 """
             )
