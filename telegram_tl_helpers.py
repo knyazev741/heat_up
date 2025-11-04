@@ -207,12 +207,32 @@ def make_read_history_query(
     peer: pylogram.raw.base.input_peer.InputPeer,
     max_id: int = 0
 ) -> str:
-    """Create ReadHistory query to mark messages as read up to max_id"""
+    """Create ReadHistory query to mark messages as read up to max_id
+    
+    Note: For channels/supergroups, uses channels.ReadHistory
+          For chats/users, uses messages.ReadHistory
+    """
 
-    raw_method = pylogram.raw.functions.messages.ReadHistory(
-        peer=peer,
-        max_id=max_id
-    )
+    # Check peer type and use appropriate method
+    peer_type = peer.__class__.__name__
+    
+    if 'Channel' in peer_type:
+        # For channels, use channels.ReadHistory with channel parameter
+        # Extract channel_id and access_hash from InputPeerChannel
+        channel = pylogram.raw.types.InputChannel(
+            channel_id=peer.channel_id,
+            access_hash=peer.access_hash
+        )
+        raw_method = pylogram.raw.functions.channels.ReadHistory(
+            channel=channel,
+            max_id=max_id
+        )
+    else:
+        # For chats/users, use messages.ReadHistory
+        raw_method = pylogram.raw.functions.messages.ReadHistory(
+            peer=peer,
+            max_id=max_id
+        )
 
     return raw_method_to_string(raw_method)
 

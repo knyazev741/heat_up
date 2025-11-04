@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     scheduler_check_interval: int = 1800  # 30 минут
     scheduler_enabled: bool = True
     
+    # Admin API sync settings
+    admin_sync_enabled: bool = True  # Enable automatic sync from Admin API
+    admin_sync_interval_hours: int = 24  # Sync every 24 hours (once per day)
+    
     # Warmup stages
     warmup_max_stage: int = 14  # 14 дней базового прогрева
     

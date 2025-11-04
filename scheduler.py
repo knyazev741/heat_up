@@ -28,6 +28,7 @@ from database import (
     update_account_stage,
     should_skip_warmup
 )
+from admin_sync import sync_session_statuses, get_last_sync_time, save_last_sync_time
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,26 @@ class WarmupScheduler:
         logger.info(f"Started at: {self.started_at}")
         logger.info("=" * 100)
         
+        # Perform initial sync from Admin API if enabled
+        if settings.admin_sync_enabled:
+            logger.info("🔄 Performing initial Admin API sync...")
+            try:
+                result = await sync_session_statuses()
+                if result['success']:
+                    save_last_sync_time()
+                    logger.info(
+                        f"✅ Initial sync completed: "
+                        f"{result['frozen_count']} frozen, "
+                        f"{result['deleted_count']} deleted, "
+                        f"{result['banned_forever_count']} banned forever"
+                    )
+                else:
+                    logger.warning(f"⚠️ Initial sync failed: {result.get('error', 'Unknown error')}")
+            except Exception as e:
+                logger.error(f"❌ Error during initial sync: {e}")
+        else:
+            logger.info("ℹ️ Admin API sync disabled in settings")
+        
         self._task = asyncio.create_task(self._run_loop())
     
     async def stop(self):
@@ -95,6 +116,40 @@ class WarmupScheduler:
                 logger.info("=" * 80)
                 logger.info("⏰ SCHEDULER CHECK CYCLE")
                 logger.info("=" * 80)
+                
+                # Check if we need to sync from Admin API
+                if settings.admin_sync_enabled:
+                    last_sync = get_last_sync_time()
+                    sync_interval = timedelta(hours=settings.admin_sync_interval_hours)
+                    
+                    should_sync = False
+                    if last_sync is None:
+                        # Never synced, sync now
+                        should_sync = True
+                        logger.info("🔄 No previous sync found - syncing now...")
+                    else:
+                        time_since_sync = datetime.utcnow() - last_sync
+                        if time_since_sync >= sync_interval:
+                            should_sync = True
+                            logger.info(
+                                f"🔄 Last sync was {time_since_sync.total_seconds()/3600:.1f}h ago "
+                                f"(interval: {settings.admin_sync_interval_hours}h) - syncing..."
+                            )
+                    
+                    if should_sync:
+                        try:
+                            result = await sync_session_statuses()
+                            if result['success']:
+                                save_last_sync_time()
+                                logger.info(
+                                    f"✅ Sync completed: {result['frozen_count']} frozen, "
+                                    f"{result['deleted_count']} deleted, "
+                                    f"{result['banned_forever_count']} banned forever"
+                                )
+                            else:
+                                logger.warning(f"⚠️ Sync failed: {result.get('error', 'Unknown error')}")
+                        except Exception as e:
+                            logger.error(f"❌ Error during sync: {e}")
                 
                 # Получить аккаунты для прогрева
                 accounts = get_accounts_for_warmup()
