@@ -398,54 +398,138 @@ class ActionExecutor:
             logger.info("💎 Premium account - skipping sponsored messages")
 
         unread_count = None
+        read_inbox_max_id = 0
+        top_message_id = 0
+        
         dialog_info = await self.telegram_client.get_peer_dialog(session_id, resolved_peer)
         if dialog_info.get("success"):
             unread_count = dialog_info.get("unread_count", 0)
+            read_inbox_max_id = dialog_info.get("read_inbox_max_id", 0)
+            top_message_id = dialog_info.get("top_message", 0)
             logger.info(f"📨 Unread messages in {chat_username}: {unread_count}")
+            if unread_count > 0:
+                logger.info(f"   First unread: #{read_inbox_max_id + 1}, Last: #{top_message_id}")
         else:
             logger.warning(f"⚠️ Could not get dialog info for {chat_username}: {dialog_info.get('error')}")
 
-        history_result = await self.telegram_client.get_chat_history(session_id, resolved_peer, limit=10)
         messages_read = 0
         messages_texts = []
         last_message_id = 0
+        actual_read_time = 0.0
 
-        if not history_result.get("error"):
-            try:
-                result_data = history_result.get("result") or {}
-                if isinstance(result_data, dict):
-                    messages = result_data.get("messages", [])
-                elif isinstance(result_data, list):
-                    messages = result_data
-                else:
-                    messages = []
-
-                logger.info(f"📥 Received {len(messages)} messages from {chat_username}")
-
-                for msg in messages[:10]:
-                    msg_id = msg.get("id")
-                    if isinstance(msg_id, int):
-                        last_message_id = max(last_message_id, msg_id)
-                    msg_text = msg.get("message") or msg.get("text", "")
-                    if msg_text:
-                        text_preview = msg_text[:200] + "..." if len(msg_text) > 200 else msg_text
-                        logger.info(f"  📬 Msg #{msg.get('id', '?')}: {text_preview}")
-                        messages_texts.append(text_preview)
-                        messages_read += 1
+        # Читаем сообщения правильно - с первого непрочитанного
+        if unread_count and unread_count > 0:
+            # Ограничиваем максимум для безопасности (не более 50 за раз)
+            max_messages_to_read = min(unread_count, 50)
+            first_unread_id = read_inbox_max_id + 1
+            
+            logger.info(f"📥 Reading {max_messages_to_read} unread messages starting from #{first_unread_id}...")
+            
+            # Используем низкоуровневый API для чтения с конкретного сообщения
+            from telegram_tl_helpers import make_get_history_query
+            
+            query = make_get_history_query(
+                peer=resolved_peer['input_peer'],
+                offset_id=first_unread_id,
+                add_offset=0,
+                limit=max_messages_to_read
+            )
+            
+            history_result = await self.telegram_client.invoke_raw(session_id, query)
+            
+            if not history_result.get("error"):
+                try:
+                    result_data = history_result.get("result") or {}
+                    if isinstance(result_data, dict):
+                        messages = result_data.get("messages", [])
+                    elif isinstance(result_data, list):
+                        messages = result_data
                     else:
-                        media_type = msg.get("media", {}).get("_", "unknown") if msg.get("media") else "no media"
-                        logger.info(f"  📷 Msg #{msg.get('id', '?')}: [media: {media_type}]")
+                        messages = []
 
-                if messages_read == 0:
-                    logger.info(f"📭 No text messages found in {chat_username}")
-                else:
-                    logger.info(f"✅ Read {messages_read} text messages from {chat_username}")
-            except Exception as exc:
-                logger.error(f"Error parsing messages: {exc}")
-                messages_read = 0
+                    # Сортируем от старых к новым (как читает человек)
+                    messages_sorted = sorted(messages, key=lambda m: m.get('id', 0))
+                    
+                    logger.info(f"📥 Got {len(messages_sorted)} unread messages")
+                    if messages_sorted:
+                        logger.info(f"   Range: #{messages_sorted[0].get('id')} - #{messages_sorted[-1].get('id')}")
+
+                    # Читаем сообщения с реалистичным временем
+                    skip_probability = 0.15 if len(messages_sorted) >= 3 else 0
+                    
+                    for i, msg in enumerate(messages_sorted):
+                        msg_id = msg.get("id")
+                        if isinstance(msg_id, int):
+                            last_message_id = max(last_message_id, msg_id)
+                        
+                        msg_text = msg.get("message") or msg.get("text", "")
+                        text_length = len(msg_text)
+                        
+                        # Вычисляем время чтения для этого сообщения
+                        if random.random() < skip_probability:
+                            # Быстрое пролистывание - не вникая
+                            msg_read_time = random.uniform(0.3, 0.8)
+                        else:
+                            # Реальное чтение: 3-6 символов в секунду
+                            base_time = 1.0
+                            reading_speed = random.uniform(3, 6)
+                            reading_time = text_length / reading_speed if text_length > 0 else 0
+                            thinking_time = random.uniform(0.5, 2.0)
+                            
+                            msg_read_time = base_time + reading_time + thinking_time
+                            msg_read_time = min(msg_read_time, 30.0)  # Максимум 30 сек
+                        
+                        actual_read_time += msg_read_time
+                        
+                        if msg_text:
+                            text_preview = msg_text[:200] + "..." if len(msg_text) > 200 else msg_text
+                            if i < 3:  # Логируем первые 3
+                                logger.info(f"  📬 Msg #{msg.get('id', '?')} ({text_length} chars, {msg_read_time:.1f}s): {text_preview[:80]}...")
+                            messages_texts.append(text_preview)
+                            messages_read += 1
+                        else:
+                            media_type = msg.get("media", {}).get("_", "unknown") if msg.get("media") else "no media"
+                            if i < 3:
+                                logger.info(f"  📷 Msg #{msg.get('id', '?')} ({msg_read_time:.1f}s): [media: {media_type}]")
+                            messages_read += 1
+                        
+                        # Имитируем чтение этого сообщения
+                        await asyncio.sleep(msg_read_time)
+
+                    if messages_read == 0:
+                        logger.info(f"📭 No messages found in {chat_username}")
+                    else:
+                        avg_time = actual_read_time / messages_read if messages_read > 0 else 0
+                        logger.info(f"✅ Read {messages_read} messages in {actual_read_time:.1f}s (avg {avg_time:.1f}s/msg)")
+                        
+                except Exception as exc:
+                    logger.error(f"Error parsing messages: {exc}")
+                    messages_read = 0
+            else:
+                error_msg = history_result.get("error", "Unknown error")
+                logger.warning(f"⚠️ Could not fetch messages from {chat_username}: {error_msg}")
         else:
-            error_msg = history_result.get("error", "Unknown error")
-            logger.warning(f"⚠️ Could not fetch messages from {chat_username}: {error_msg}")
+            # Нет непрочитанных - просто читаем последние для вида
+            logger.info(f"✅ All messages already read in {chat_username}")
+            history_result = await self.telegram_client.get_chat_history(session_id, resolved_peer, limit=5)
+            
+            if not history_result.get("error"):
+                try:
+                    result_data = history_result.get("result") or {}
+                    messages = result_data.get("messages", []) if isinstance(result_data, dict) else []
+                    
+                    for msg in messages[:3]:
+                        msg_id = msg.get("id")
+                        if isinstance(msg_id, int):
+                            last_message_id = max(last_message_id, msg_id)
+                        msg_text = msg.get("message") or msg.get("text", "")
+                        if msg_text:
+                            messages_texts.append(msg_text[:200])
+                            
+                    # Минимальное время для вида
+                    await asyncio.sleep(random.uniform(2, 5))
+                except Exception as exc:
+                    logger.error(f"Error reading already-read messages: {exc}")
 
         marked_read = False
         if unread_count and unread_count > 0 and last_message_id:
@@ -455,8 +539,6 @@ class ActionExecutor:
                 logger.info(f"👁️ Marked messages up to #{last_message_id} as read in {chat_username}")
             else:
                 logger.warning(f"⚠️ Failed to mark history as read: {mark_result.get('error')}")
-
-        await asyncio.sleep(duration)
 
         response = {
             "action": "read_messages",
