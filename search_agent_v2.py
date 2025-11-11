@@ -1,27 +1,27 @@
 """
-SearchAgent - REAL web search для Telegram каналов через Google Custom Search API
+SearchAgent V2 - с реальным переходом на сайты и извлечением ссылок
 """
 
 import re
 import logging
 import asyncio
-from typing import Dict, Any, List
-from urllib.parse import urlparse
-import httpx
-from bs4 import BeautifulSoup
+from typing import Dict, Any, List, Set
+from duckduckgo_search import DDGS
 from openai import OpenAI
 from config import settings
-import json
+import httpx
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
 
 logger = logging.getLogger(__name__)
 
 
-class SearchAgent:
+class SearchAgentV2:
     """
-    Агент поиска РЕАЛЬНЫХ Telegram-чатов через Google Custom Search API
+    Агент поиска с реальным web scraping
     
-    1. Генерирует разные поисковые запросы (город + интересы)
-    2. Ищет в Google Custom Search API
+    1. Генерирует поисковые запросы (город + интересы)
+    2. Ищет в DuckDuckGo
     3. ПЕРЕХОДИТ НА САЙТЫ и скрейпит HTML
     4. Извлекает Telegram-ссылки со страниц
     5. LLM оценивает релевантность каналов
@@ -35,17 +35,9 @@ class SearchAgent:
         )
         self.model = "deepseek-chat"
         
-        # Google Custom Search API
-        self.google_api_key = settings.google_search_api_key
-        self.google_engine_id = settings.google_search_engine_id
-        self.google_api_url = "https://www.googleapis.com/customsearch/v1"
-        
-        if not self.google_api_key or not self.google_engine_id:
-            logger.warning("Google Search API not configured - search will be limited")
-        
-        # HTTP клиент для web scraping
+        # HTTP клиент для скрейпинга
         self.http_client = httpx.AsyncClient(
-            timeout=15.0,
+            timeout=10.0,  # 10 секунд на запрос
             follow_redirects=True,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -60,6 +52,21 @@ class SearchAgent:
             'youtube.com', 'tiktok.com', 'linkedin.com', 'reddit.com',
             'pinterest.com', 'amazon.com', 'ebay.com'
         }
+        
+        # Черный список username
+        self.blacklisted_usernames = {
+            'gmail', 'mail', 'yandex', 'yahoo', 'outlook', 'hotmail', 'icloud',
+            'protonmail', 'aol', 'zoho', 'mailru', 'rambler',
+            'instagram', 'facebook', 'twitter', 'tiktok', 'youtube', 'linkedin',
+            'whatsapp', 'viber', 'skype', 'discord', 'snapchat',
+            'pinterest', 'reddit', 'tumblr', 'flickr', 'vimeo',
+            'amazon', 'ebay', 'aliexpress', 'spotify', 'netflix',
+            'google', 'microsoft', 'apple', 'samsung', 'huawei',
+            'twitch', 'steam', 'playstation', 'xbox', 'nintendo',
+            'badoo', 'tinder', 'bumble', 'hinge', 'okcupid',
+            'magenta', 'telekom', 'vodafone', 'orange', 't-mobile',
+            'katyperry', 'justinbieber', 'arianagrande', 'selenagomez'
+        }
     
     async def find_relevant_chats(
         self,
@@ -67,7 +74,7 @@ class SearchAgent:
         limit: int = 20
     ) -> List[Dict[str, Any]]:
         """
-        Ищет РЕАЛЬНЫЕ Telegram-чаты через Google Custom Search API + web scraping
+        Ищет РЕАЛЬНЫЕ Telegram-чаты через DuckDuckGo + web scraping
         
         Args:
             persona: Словарь с данными персоны
@@ -78,24 +85,15 @@ class SearchAgent:
         """
         logger.info(f"🔍 Searching REAL Telegram chats for: {persona.get('generated_name')}")
         
-        # Проверяем конфигурацию Google API
-        if not self.google_api_key or not self.google_engine_id:
-            logger.error("Google Search API not configured! Please set GOOGLE_SEARCH_API and GOOGLE_SEARCH_ENGINE_ID in .env")
-            return []
-        
         # Генерируем поисковые запросы
         queries = self._generate_search_queries(persona)
         logger.info(f"Generated {len(queries)} search queries")
         
-        # Ищем в Google и собираем URLs для скрейпинга
-        urls_to_scrape = await self._search_google(queries)
+        # Ищем в DuckDuckGo (получаем URLs)
+        urls_to_scrape = await self._search_duckduckgo(queries)
         logger.info(f"Got {len(urls_to_scrape)} URLs to scrape")
         
-        if not urls_to_scrape:
-            logger.warning("No URLs found from Google search!")
-            return []
-        
-        # Скрейпим сайты параллельно
+        # Скрейпим сайты
         all_channels = await self._scrape_websites(urls_to_scrape)
         logger.info(f"Found {len(all_channels)} UNIQUE channels after scraping")
         
@@ -142,43 +140,21 @@ class SearchAgent:
         
         return queries[:15]  # Макс 15 запросов
     
-    async def _search_google(self, queries: List[str]) -> List[Dict[str, Any]]:
-        """
-        Ищет в Google Custom Search API и собирает URLs для скрейпинга
+    async def _search_duckduckgo(self, queries: List[str]) -> List[Dict[str, Any]]:
+        """Ищет в DuckDuckGo и собирает URLs для скрейпинга"""
         
-        Args:
-            queries: Список поисковых запросов
-            
-        Returns:
-            Список словарей с URL и метаданными для скрейпинга
-        """
         urls_to_scrape = []
         seen_urls = set()
         
-        for q in queries:
-            logger.info(f"Searching Google: {q}")
-            
-            if not self.google_api_key or not self.google_engine_id:
-                continue
-            
-            params = {
-                'key': self.google_api_key,
-                'cx': self.google_engine_id,
-                'q': q,
-                'num': 10  # Максимум 10 результатов за запрос
-            }
-            
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(self.google_api_url, params=params)
-                    response.raise_for_status()
+        with DDGS() as ddgs:
+            for q in queries:
+                logger.info(f"Searching DuckDuckGo: {q}")
+                try:
+                    results = list(ddgs.text(q, max_results=10))
+                    logger.info(f"  → Got {len(results)} results")
                     
-                    data = response.json()
-                    items = data.get('items', [])
-                    logger.info(f"  → Got {len(items)} results from Google API")
-                    
-                    for item in items:
-                        url = item.get('link', '')
+                    for r in results:
+                        url = r.get('href', '')
                         if url and url not in seen_urls:
                             # Проверяем домен
                             domain = urlparse(url).netloc.lower()
@@ -190,22 +166,15 @@ class SearchAgent:
                             
                             urls_to_scrape.append({
                                 'url': url,
-                                'title': item.get('title', ''),
-                                'snippet': item.get('snippet', ''),
-                                'displayLink': item.get('displayLink', ''),
+                                'title': r.get('title', ''),
+                                'snippet': r.get('body', ''),
                                 'query': q
                             })
                             seen_urls.add(url)
                     
-                    # Небольшая задержка между запросами (чтобы не превысить лимиты)
-                    await asyncio.sleep(0.5)
-                    
-            except httpx.HTTPStatusError as e:
-                logger.error(f"  ✗ HTTP Error {e.response.status_code} for query '{q}': {e.response.text[:200]}")
-                continue
-            except Exception as e:
-                logger.error(f"  ✗ Error searching Google for '{q}': {e}")
-                continue
+                except Exception as e:
+                    logger.error(f"Search error for '{q}': {e}")
+                    continue
         
         return urls_to_scrape
     
@@ -213,12 +182,10 @@ class SearchAgent:
         """
         Скрейпит сайты параллельно и извлекает Telegram-каналы
         
-        Args:
-            urls: Список словарей с URL и метаданными
-            
         Returns:
             {username: {channel_data}}
         """
+        
         # Ограничиваем количество сайтов (чтобы не тратить много времени)
         urls_to_process = urls[:30]  # Макс 30 сайтов
         
@@ -247,26 +214,24 @@ class SearchAgent:
         """
         Скрейпит одну страницу и извлекает Telegram-каналы
         
-        Args:
-            url_data: Словарь с URL и метаданными
-            
         Returns:
             {username: {channel_data}}
         """
         url = url_data['url']
-        logger.debug(f"  📄 Scraping: {url[:80]}...")
+        logger.info(f"  📄 Scraping: {url[:80]}...")
         
         try:
+            # HTTP запрос
             response = await self.http_client.get(url)
             response.raise_for_status()
             
             html = response.text
-            logger.debug(f"    ✓ Loaded {len(html)} chars")
+            logger.info(f"    ✓ Loaded {len(html)} chars")
             
             # Парсим HTML
             soup = BeautifulSoup(html, 'lxml')
             
-            # Удаляем script и style теги
+            # Удаляем script и style теги (не нужны)
             for tag in soup(['script', 'style']):
                 tag.decompose()
             
@@ -276,19 +241,18 @@ class SearchAgent:
             # Извлекаем каналы
             channels = self._extract_channels_from_html(soup, page_text, url_data)
             
-            if channels:
-                logger.debug(f"    ✓ Extracted {len(channels)} channels")
+            logger.info(f"    ✓ Extracted {len(channels)} channels")
             
             return channels
             
         except httpx.TimeoutException:
-            logger.debug(f"    ✗ Timeout: {url[:60]}")
+            logger.warning(f"    ✗ Timeout: {url[:60]}")
             return {}
         except httpx.HTTPStatusError as e:
-            logger.debug(f"    ✗ HTTP {e.response.status_code}: {url[:60]}")
+            logger.warning(f"    ✗ HTTP {e.response.status_code}: {url[:60]}")
             return {}
         except Exception as e:
-            logger.debug(f"    ✗ Error: {e}")
+            logger.error(f"    ✗ Error: {e}")
             return {}
     
     def _extract_channels_from_html(
@@ -300,32 +264,11 @@ class SearchAgent:
         """
         Извлекает Telegram-каналы из HTML
         
-        Args:
-            soup: BeautifulSoup объект
-            page_text: Текст страницы
-            url_data: Метаданные URL
-            
         Returns:
             {username: {channel_data}}
         """
         
         channels = {}
-        
-        # Черный список username
-        blacklist = {
-            'gmail', 'mail', 'yandex', 'yahoo', 'outlook', 'hotmail', 'icloud',
-            'protonmail', 'aol', 'zoho', 'mailru', 'rambler',
-            'instagram', 'facebook', 'twitter', 'tiktok', 'youtube', 'linkedin',
-            'whatsapp', 'viber', 'skype', 'discord', 'snapchat',
-            'pinterest', 'reddit', 'tumblr', 'flickr', 'vimeo',
-            'amazon', 'ebay', 'aliexpress', 'spotify', 'netflix',
-            'google', 'microsoft', 'apple', 'samsung', 'huawei',
-            'twitch', 'steam', 'playstation', 'xbox', 'nintendo',
-            'badoo', 'tinder', 'bumble', 'hinge', 'okcupid',
-            'magenta', 'telekom', 'vodafone', 'orange', 't-mobile',
-            'katyperry', 'justinbieber', 'arianagrande', 'selenagomez',
-            'telegram'  # Общий канал Telegram
-        }
         
         # 1. ПРИОРИТЕТ: Ищем все t.me/ ссылки в <a> тегах
         telegram_links = soup.find_all('a', href=re.compile(r'(t\.me|telegram\.me)/'))
@@ -333,32 +276,33 @@ class SearchAgent:
         for link in telegram_links:
             href = link.get('href', '')
             
-            # Извлекаем username
+            # Извлекаем username из ссылки
             match = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]+)', href)
             if match:
                 username = match.group(1)
                 
-                if not self._is_valid_username(username, blacklist):
+                # Фильтруем
+                if not self._is_valid_username(username):
                     continue
                 
-                # Получаем контекст
+                # Получаем контекст вокруг ссылки
                 link_text = link.get_text(strip=True)
-                parent_text = link.find_parent().get_text(strip=True) if link.find_parent() else ''
+                parent_text = link.parent.get_text(strip=True) if link.parent else ''
                 
                 if username not in channels:
                     channels[username] = {
                         'username': f"@{username}",
-                        'title': link_text[:100] or url_data.get('title', '')[:100] or username,
-                        'description': parent_text[:200] or url_data.get('snippet', '')[:200],
+                        'title': link_text[:100] or username,
+                        'description': parent_text[:200],
                         'source_url': url_data['url'],
-                        'confidence': 'high'
+                        'confidence': 'high'  # Прямая ссылка в <a> теге
                     }
         
-        # 2. Ищем t.me/ упоминания в тексте
+        # 2. Ищем t.me/ упоминания в тексте (могут быть не в <a>)
         text_links = re.findall(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]+)', page_text)
         
-        for username in set(text_links):  # set() для уникальности
-            if not self._is_valid_username(username, blacklist):
+        for username in text_links:
+            if not self._is_valid_username(username):
                 continue
             
             if username not in channels:
@@ -367,21 +311,21 @@ class SearchAgent:
                     'title': username,
                     'description': url_data.get('snippet', '')[:200],
                     'source_url': url_data['url'],
-                    'confidence': 'medium'
+                    'confidence': 'medium'  # Упоминание в тексте
                 }
         
-        # 3. Ищем @username упоминания (только если есть Telegram контекст)
+        # 3. Ищем @username упоминания (только если в контексте Telegram)
         page_text_lower = page_text.lower()
         has_telegram_context = any(
-            keyword in page_text_lower
+            keyword in page_text_lower 
             for keyword in ['telegram', 't.me', 'телеграм', 'телеграмм', 'телега']
         )
         
         if has_telegram_context:
             mentions = re.findall(r'@([a-zA-Z][a-zA-Z0-9_]{4,31})', page_text)
             
-            for username in set(mentions):
-                if not self._is_valid_username(username, blacklist):
+            for username in set(mentions):  # set() для уникальности
+                if not self._is_valid_username(username):
                     continue
                 
                 if username not in channels:
@@ -390,39 +334,41 @@ class SearchAgent:
                         'title': username,
                         'description': url_data.get('snippet', '')[:200],
                         'source_url': url_data['url'],
-                        'confidence': 'low'
+                        'confidence': 'low'  # Упоминание без t.me/
                     }
         
         return channels
     
-    def _is_valid_username(self, username: str, blacklist: set) -> bool:
+    def _is_valid_username(self, username: str) -> bool:
         """Проверяет валидность Telegram username"""
         
         username_lower = username.lower()
         
-        if username_lower in blacklist:
+        # 1. Черный список
+        if username_lower in self.blacklisted_usernames:
             return False
         
+        # 2. Длина
         if len(username) < 5 or len(username) > 32:
             return False
         
-        if '.' in username or '___' in username:
+        # 3. Содержит точку (email-подобные)
+        if '.' in username:
             return False
         
-        if username.endswith('_') or username.startswith('_'):
+        # 4. Множественные подчеркивания (Instagram паттерн)
+        if '___' in username or username.endswith('_') or username.startswith('_'):
             return False
         
+        # 5. Длинные числа в конце (user12345)
         if re.search(r'\d{3,}$', username):
             return False
         
+        # 6. Должен начинаться с буквы
         if not username[0].isalpha():
             return False
         
         return True
-    
-    async def close(self):
-        """Закрывает HTTP клиент"""
-        await self.http_client.aclose()
     
     async def _rank_chats_with_llm(
         self,
@@ -503,6 +449,7 @@ class SearchAgent:
             else:
                 json_str = response_text.strip()
             
+            import json
             rankings = json.loads(json_str)
             
             # Объединяем с оригинальными данными
@@ -544,3 +491,11 @@ class SearchAgent:
                 "relevance_score": 0.5,
                 "relevance_reason": "Found via search"
             } for ch in channels_for_llm]
+    
+    async def close(self):
+        """Закрывает HTTP клиент"""
+        await self.http_client.aclose()
+
+
+
+

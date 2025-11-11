@@ -113,6 +113,8 @@ async def lifespan(app: FastAPI):
     cleanup_task_handle.cancel()
     if telegram_client:
         await telegram_client.close()
+    if search_agent:
+        await search_agent.close()
     logger.info("Service stopped")
 
 
@@ -860,6 +862,138 @@ async def check_account_health_endpoint(account_id: int):
         return health
     except Exception as e:
         logger.error(f"Error checking account health: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/accounts/{account_id}/refresh-channels")
+async def refresh_channels_endpoint(account_id: int):
+    """
+    Принудительно запустить поиск новых каналов для аккаунта
+    
+    Args:
+        account_id: Account ID
+        
+    Returns:
+        Список новых найденных каналов
+    """
+    try:
+        # Получаем аккаунт и персону
+        account = get_account_by_id(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found")
+        
+        persona = get_persona(account_id)
+        if not persona:
+            raise HTTPException(status_code=400, detail="Persona not found. Generate persona first.")
+        
+        logger.info(f"🔄 Manually refreshing channels for account {account_id} (session: {account['session_id'][:8]}...)")
+        
+        # Запускаем поиск
+        new_chats = await search_agent.find_relevant_chats(
+            persona,
+            limit=settings.search_chats_per_persona
+        )
+        
+        # Сохраняем в базу
+        saved_count = 0
+        for chat in new_chats:
+            chat_id = save_discovered_chat(account_id, chat)
+            if chat_id:
+                saved_count += 1
+        
+        logger.info(f"✅ Saved {saved_count}/{len(new_chats)} new channels")
+        
+        # Возвращаем обновленный список каналов
+        all_chats = get_relevant_chats(account_id, limit=50)
+        
+        return {
+            "success": True,
+            "message": f"Found and saved {saved_count} new channels",
+            "new_channels_count": saved_count,
+            "total_channels_count": len(all_chats),
+            "channels": all_chats
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error refreshing channels: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/refresh-all-low-channel-accounts")
+async def refresh_all_low_channel_accounts_endpoint():
+    """
+    Принудительно обновить каналы для всех аккаунтов с малым количеством каналов (< 5)
+    
+    Returns:
+        Результаты обновления
+    """
+    try:
+        all_accounts = get_all_accounts()
+        
+        results = []
+        for account in all_accounts:
+            account_id = account['id']
+            current_chats = get_relevant_chats(account_id, limit=100)
+            
+            # Обновляем только если < 5 каналов
+            if len(current_chats) < 5:
+                try:
+                    persona = get_persona(account_id)
+                    if not persona:
+                        logger.warning(f"Account {account_id} has no persona - skipping")
+                        results.append({
+                            "account_id": account_id,
+                            "session_id": account['session_id'][:8],
+                            "success": False,
+                            "error": "No persona"
+                        })
+                        continue
+                    
+                    logger.info(f"🔄 Refreshing channels for account {account_id} ({len(current_chats)} channels)")
+                    
+                    new_chats = await search_agent.find_relevant_chats(
+                        persona,
+                        limit=settings.search_chats_per_persona
+                    )
+                    
+                    saved_count = 0
+                    for chat in new_chats:
+                        chat_id = save_discovered_chat(account_id, chat)
+                        if chat_id:
+                            saved_count += 1
+                    
+                    results.append({
+                        "account_id": account_id,
+                        "session_id": account['session_id'][:8],
+                        "success": True,
+                        "before_count": len(current_chats),
+                        "new_count": saved_count,
+                        "after_count": len(get_relevant_chats(account_id, limit=100))
+                    })
+                    
+                    logger.info(f"✅ Account {account_id}: {len(current_chats)} → {saved_count} new → total {len(get_relevant_chats(account_id, limit=100))}")
+                    
+                except Exception as e:
+                    logger.error(f"Error refreshing account {account_id}: {e}")
+                    results.append({
+                        "account_id": account_id,
+                        "session_id": account['session_id'][:8],
+                        "success": False,
+                        "error": str(e)
+                    })
+        
+        success_count = sum(1 for r in results if r['success'])
+        
+        return {
+            "success": True,
+            "message": f"Refreshed {success_count}/{len(results)} accounts",
+            "results": results
+        }
+    
+    except Exception as e:
+        logger.error(f"Error refreshing all accounts: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

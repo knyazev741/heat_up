@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from typing import List
 import json
 import logging
@@ -38,12 +39,17 @@ class Settings(BaseSettings):
     search_chats_per_persona: int = 20
     use_web_search: bool = False
     
+    # Google Custom Search API
+    google_search_api_key: str = Field(default="", alias="GOOGLE_SEARCH_API")  # Google Custom Search API key
+    google_search_engine_id: str = Field(default="", alias="GOOGLE_SEARCH_ENGINE_ID")  # Search Engine ID (cx parameter)
+    
     # Content randomization
     enable_content_randomization: bool = True
     message_variations_count: int = 10
     
     class Config:
         env_file = ".env"
+        populate_by_name = True  # Allow both field name and alias
 
 
 settings = Settings()
