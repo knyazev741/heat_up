@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   heat_up:
     build: .

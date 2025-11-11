@@ -3,7 +3,7 @@ import sys
 import asyncio
 from datetime import datetime
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
@@ -18,6 +18,7 @@ from monitoring import WarmupMonitor
 from persona_agent import PersonaAgent
 from search_agent import SearchAgent
 from admin_api_client import AdminAPIClient
+from auth import verify_api_token
 from models import (
     AddAccountRequest, UpdateAccountRequest, AccountResponse, 
     AccountDetailResponse, WarmupNowRequest, StatisticsResponse,
@@ -469,9 +470,12 @@ def normalize_country_name(country: Optional[str]) -> Optional[str]:
 
 
 @app.post("/accounts/add")
-async def add_account_endpoint(request: AddAccountRequest):
+async def add_account_endpoint(
+    request: AddAccountRequest,
+    token_info: dict = Depends(verify_api_token)
+):
     """
-    Add new account to warmup system
+    Add new account to warmup system (requires API token)
     
     1. Get country from Admin API by session_id
     2. Generate unique persona for this account
@@ -481,6 +485,7 @@ async def add_account_endpoint(request: AddAccountRequest):
     
     Args:
         request: AddAccountRequest with session_id, phone_number, etc.
+        token_info: API token information (automatically verified)
         
     Returns:
         Account information with persona and discovered chats
