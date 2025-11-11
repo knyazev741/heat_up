@@ -26,7 +26,8 @@ from database import (
     save_warmup_session,
     update_account,
     update_account_stage,
-    should_skip_warmup
+    should_skip_warmup,
+    wait_for_warmup_delay
 )
 from admin_sync import sync_session_statuses, get_last_sync_time, save_last_sync_time
 
@@ -275,6 +276,9 @@ class WarmupScheduler:
                 logger.warning(f"   This session will be excluded from warmup to save LLM tokens")
                 logger.info("=" * 100)
                 return
+            
+            # 1.6. Ожидать задержку для новых сессий (если нужно)
+            await wait_for_warmup_delay(account)
             
             # 2. Проверить/создать личность
             persona = get_persona(account_id)

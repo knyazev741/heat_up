@@ -1,6 +1,7 @@
 import logging
 import sys
 import asyncio
+from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -25,7 +26,7 @@ from models import (
 from database import (
     add_account, get_account, get_account_by_id, get_all_accounts,
     update_account, get_persona, get_relevant_chats, get_warmup_sessions,
-    save_persona, save_discovered_chat
+    save_persona, save_discovered_chat, wait_for_warmup_delay, check_warmup_delay
 )
 
 # Configure logging
@@ -229,7 +230,30 @@ async def warmup_session(
         else:
             executor = ActionExecutor(telegram_client)
         
-        # Execute actions in background
+        # Проверяем задержку для новых сессий (после генерации плана)
+        if account_data:
+            should_wait, delay_until = check_warmup_delay(account_data)
+            if should_wait and delay_until:
+                wait_hours = (delay_until - datetime.utcnow()).total_seconds() / 3600
+                logger.info(
+                    f"⏳ Session {session_id[:8]}... has delay until {delay_until.isoformat()} "
+                    f"({wait_hours:.2f} hours). Actions will be executed after delay."
+                )
+                # Запускаем выполнение в фоне с задержкой
+                async def delayed_execution():
+                    await wait_for_warmup_delay(account_data)
+                    await executor.execute_action_plan(session_id, action_plan)
+                
+                asyncio.create_task(delayed_execution())
+                
+                return WarmupResponse(
+                    session_id=session_id,
+                    status="scheduled",
+                    message=f"Warmup scheduled with {len(action_plan)} actions. Will start after delay (until {delay_until.isoformat()})",
+                    action_plan=action_plan
+                )
+        
+        # Execute actions in background (без задержки или задержка уже прошла)
         background_tasks.add_task(
             execute_warmup_background,
             session_id,
@@ -287,6 +311,15 @@ async def warmup_session_sync(
                 raise HTTPException(
                     status_code=400,
                     detail=f"Cannot warmup session: {skip_reason}. This session is excluded to save LLM tokens."
+                )
+            
+            # Проверяем задержку для новых сессий
+            should_wait, delay_until = check_warmup_delay(account_data)
+            if should_wait and delay_until:
+                wait_hours = (delay_until - datetime.utcnow()).total_seconds() / 3600
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Warmup is delayed for this new session. Actions will start after {delay_until.isoformat()} ({wait_hours:.2f} hours). Use async endpoint /warmup/{session_id} to schedule execution."
                 )
         
         persona_data = None
@@ -365,6 +398,12 @@ async def execute_warmup_background(
     """Background task for executing warmup actions"""
     try:
         logger.info(f"Starting background execution for session {session_id}")
+        
+        # Проверяем и ждем задержку для новых сессий перед выполнением действий
+        account_data = get_account(session_id)
+        if account_data:
+            await wait_for_warmup_delay(account_data)
+        
         execution_summary = await executor.execute_action_plan(session_id, action_plan)
         logger.info(
             f"Background execution completed for session {session_id}: "

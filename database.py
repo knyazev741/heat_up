@@ -7,6 +7,7 @@ Manages SQLite database for storing session warmup history.
 import sqlite3
 import json
 import logging
+import random
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -110,6 +111,12 @@ def init_database():
         except sqlite3.OperationalError:
             logger.info("Adding llm_generation_disabled column to accounts table")
             cursor.execute("ALTER TABLE accounts ADD COLUMN llm_generation_disabled BOOLEAN DEFAULT 0")
+        
+        try:
+            cursor.execute("SELECT warmup_start_delay_until FROM accounts LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("Adding warmup_start_delay_until column to accounts table")
+            cursor.execute("ALTER TABLE accounts ADD COLUMN warmup_start_delay_until DATETIME")
         
         # Create personas table
         cursor.execute("""
@@ -466,15 +473,19 @@ def add_account(
                 f"(Account ID: {existing['id']}, Phone: {existing['phone_number']})"
             )
         
+        # Генерируем случайную задержку от 0 до 10 часов для новой сессии
+        delay_hours = random.uniform(0, 10)
+        delay_until = datetime.utcnow() + timedelta(hours=delay_hours)
+        
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 INSERT INTO accounts (
                     session_id, phone_number, country, min_daily_activity, max_daily_activity,
-                    provider, proxy_id, first_warmup_date
+                    provider, proxy_id, first_warmup_date, warmup_start_delay_until
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -484,12 +495,17 @@ def add_account(
                     max_daily_activity,
                     kwargs.get("provider"),
                     kwargs.get("proxy_id"),
-                    datetime.utcnow()
+                    datetime.utcnow(),
+                    delay_until.isoformat()
                 )
             )
             conn.commit()
             account_id = cursor.lastrowid
-            logger.info(f"Added account {session_id} with ID {account_id}")
+            logger.info(
+                f"Added account {session_id} with ID {account_id}. "
+                f"Warmup actions will be delayed until {delay_until.isoformat()} "
+                f"({delay_hours:.2f} hours delay)"
+            )
             return account_id
     except ValueError:
         # Re-raise ValueError with informative message
@@ -1074,4 +1090,69 @@ def get_warmup_sessions(account_id: int, limit: int = 10) -> List[Dict[str, Any]
     except Exception as e:
         logger.error(f"Error getting warmup sessions: {e}")
         return []
+
+
+def check_warmup_delay(account: Dict[str, Any]) -> tuple[bool, Optional[datetime]]:
+    """
+    Проверяет, нужно ли ждать перед началом прогрева для новых сессий
+    
+    Returns:
+        (should_wait, delay_until) - нужно ли ждать и до какого времени
+    """
+    # Если сессия уже прогревалась, задержка не нужна
+    if account.get("last_warmup_date"):
+        return False, None
+    
+    delay_until_str = account.get("warmup_start_delay_until")
+    if not delay_until_str:
+        return False, None
+    
+    try:
+        delay_until = datetime.fromisoformat(delay_until_str)
+        now = datetime.utcnow()
+        
+        if delay_until > now:
+            return True, delay_until
+        else:
+            return False, None
+    except Exception as e:
+        logger.warning(f"Error checking warmup delay: {e}")
+        return False, None
+
+
+async def wait_for_warmup_delay(account: Dict[str, Any]) -> None:
+    """
+    Ожидает задержку перед началом прогрева для новых сессий
+    
+    Используется только в фоновых задачах (scheduler), не в HTTP эндпоинтах!
+    
+    Для новых сессий (без last_warmup_date) применяется случайная задержка
+    от 0 до 10 часов, чтобы избежать одновременного старта множества сессий.
+    
+    Args:
+        account: Данные аккаунта из базы
+    """
+    import asyncio
+    
+    should_wait, delay_until = check_warmup_delay(account)
+    
+    if not should_wait or not delay_until:
+        return
+    
+    now = datetime.utcnow()
+    wait_seconds = (delay_until - now).total_seconds()
+    wait_hours = wait_seconds / 3600
+    
+    logger.info(
+        f"⏳ Session {account.get('session_id', 'unknown')[:8]}... "
+        f"waiting {wait_hours:.2f} hours before starting warmup actions "
+        f"(until {delay_until.isoformat()})"
+    )
+    
+    await asyncio.sleep(wait_seconds)
+    
+    logger.info(
+        f"✅ Delay completed for session {account.get('session_id', 'unknown')[:8]}... "
+        f"starting warmup actions now"
+    )
 
