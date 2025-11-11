@@ -16,6 +16,7 @@ from scheduler import WarmupScheduler
 from monitoring import WarmupMonitor
 from persona_agent import PersonaAgent
 from search_agent import SearchAgent
+from admin_api_client import AdminAPIClient
 from models import (
     AddAccountRequest, UpdateAccountRequest, AccountResponse, 
     AccountDetailResponse, WarmupNowRequest, StatisticsResponse,
@@ -375,15 +376,69 @@ async def execute_warmup_background(
 
 # ========== NEW ENDPOINTS FOR ACCOUNT MANAGEMENT ==========
 
+def normalize_country_name(country: Optional[str]) -> Optional[str]:
+    """
+    Нормализует название страны (из "russia" в "Russia", "ukraine" в "Ukraine")
+    
+    Args:
+        country: Название страны (может быть в нижнем регистре)
+        
+    Returns:
+        Нормализованное название страны или None
+    """
+    if not country:
+        return None
+    
+    # Маппинг для нормализации названий стран
+    country_mapping = {
+        "russia": "Russia",
+        "ukraine": "Ukraine",
+        "usa": "USA",
+        "united states": "USA",
+        "germany": "Germany",
+        "france": "France",
+        "spain": "Spain",
+        "italy": "Italy",
+        "poland": "Poland",
+        "kazakhstan": "Kazakhstan",
+        "belarus": "Belarus",
+        "uzbekistan": "Uzbekistan",
+        "kyrgyzstan": "Kyrgyzstan",
+        "tajikistan": "Tajikistan",
+        "turkmenistan": "Turkmenistan",
+        "armenia": "Armenia",
+        "azerbaijan": "Azerbaijan",
+        "georgia": "Georgia",
+        "moldova": "Moldova",
+        "latvia": "Latvia",
+        "estonia": "Estonia",
+        "lithuania": "Lithuania",
+    }
+    
+    country_lower = country.lower().strip()
+    
+    # Проверяем точное совпадение
+    if country_lower in country_mapping:
+        return country_mapping[country_lower]
+    
+    # Если уже с большой буквы, возвращаем как есть
+    if country[0].isupper():
+        return country
+    
+    # Иначе делаем первую букву заглавной
+    return country.capitalize()
+
+
 @app.post("/accounts/add")
 async def add_account_endpoint(request: AddAccountRequest):
     """
     Add new account to warmup system
     
-    1. Generate unique persona for this account
-    2. Use persona's activity range (min-max daily activities, unless specified manually)
-    3. Find relevant chats based on persona
-    4. Add account to DB
+    1. Get country from Admin API by session_id
+    2. Generate unique persona for this account
+    3. Use persona's activity range (min-max daily activities, unless specified manually)
+    4. Find relevant chats based on persona
+    5. Add account to DB
     
     Args:
         request: AddAccountRequest with session_id, phone_number, etc.
@@ -404,15 +459,46 @@ async def add_account_endpoint(request: AddAccountRequest):
             logger.warning(f"Duplicate session_id: {error_msg}")
             raise HTTPException(status_code=409, detail=error_msg)
         
+        # 0.5. Получаем country из Admin API
+        country_from_api = None
+        try:
+            # Пытаемся преобразовать session_id в число
+            try:
+                session_id_int = int(request.session_id)
+            except ValueError:
+                logger.warning(f"Session ID '{request.session_id}' is not a number, skipping Admin API lookup")
+            else:
+                admin_client = AdminAPIClient()
+                try:
+                    session_data = await admin_client.get_session_by_id(session_id_int)
+                    if session_data:
+                        country_from_api = session_data.get('country')
+                        if country_from_api:
+                            country_from_api = normalize_country_name(country_from_api)
+                            logger.info(f"Got country from Admin API: '{country_from_api}' (original: '{session_data.get('country')}')")
+                        else:
+                            logger.info("Country not found in Admin API response")
+                    else:
+                        logger.info(f"Session {session_id_int} not found in Admin API")
+                except Exception as e:
+                    logger.warning(f"Failed to get country from Admin API: {e}")
+                finally:
+                    await admin_client.close()
+        except Exception as e:
+            logger.warning(f"Error getting country from Admin API: {e}, will use fallback")
+        
+        # Определяем country: приоритет у country из API, затем request.country, затем None (будет определено по номеру)
+        country = country_from_api or request.country
+        
         # Generate fake phone number if not provided
         import random
         phone_number = request.phone_number or f"+7{random.randint(9000000000, 9999999999)}"
         
         # 1. Generate persona (только для новых аккаунтов)
-        logger.info("Step 1: Generating persona...")
+        logger.info(f"Step 1: Generating persona... (country: {country})")
         persona_data = await persona_agent.generate_persona(
             phone_number,
-            request.country
+            country
         )
         
         # 2. Use activity range from persona if not specified
@@ -429,10 +515,12 @@ async def add_account_endpoint(request: AddAccountRequest):
         # 3. Add account to DB
         logger.info("Step 2: Adding account to database...")
         try:
+            # Используем country из persona_data (который уже содержит правильное значение из API или fallback)
+            account_country = persona_data.get("country") or country or request.country
             account_id = add_account(
                 session_id=request.session_id,
                 phone_number=phone_number,
-                country=persona_data.get("country", request.country),
+                country=account_country,
                 min_daily_activity=min_daily,
                 max_daily_activity=max_daily,
                 provider=request.provider,
