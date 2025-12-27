@@ -212,71 +212,10 @@ class ActionExecutor:
                     logger.info("⚠️ Will try to join anyway...")
         except Exception as exc:
             logger.warning(f"⚠️ Could not verify chat existence: {exc}")
-
         # Get sponsored messages if required (only for channel-like entities)
         sponsored_ads = []
+        # Рекламу запрашиваем ПОСЛЕ вступления в канал (per Telegram docs)
         should_fetch_ads = not is_premium and chat_type not in {"group", "supergroup", "private"}
-
-        if should_fetch_ads:
-            logger.info("🎯 Non-premium account - fetching official sponsored messages before join")
-
-            sponsored_result = await self.telegram_client.get_sponsored_messages(
-                session_id,
-                chat_username
-            )
-
-            if sponsored_result.get("success"):
-                result_data = sponsored_result.get("result", {})
-                messages = result_data.get("messages", [])
-
-                if messages:
-                    logger.info(f"📢 Found {len(messages)} sponsored message(s) for {chat_username}")
-
-                    for idx, ad in enumerate(messages, 1):
-                        title = ad.get("title", "")
-                        message = ad.get("message", "")
-                        url = ad.get("url", "")
-                        button_text = ad.get("button_text", "")
-                        recommended = ad.get("recommended", False)
-                        random_id = ad.get("random_id")
-
-                        logger.info(f"  Ad #{idx}:")
-                        logger.info(f"    Title: {title}")
-                        logger.info(f"    Message: {message[:100]}..." if len(message) > 100 else f"    Message: {message}")
-                        logger.info(f"    URL: {url}")
-                        logger.info(f"    Button: {button_text}")
-                        logger.info(f"    Recommended: {recommended}")
-
-                        sponsored_ads.append({
-                            "title": title,
-                            "message": message,
-                            "url": url,
-                            "button_text": button_text,
-                            "recommended": recommended,
-                            "random_id": random_id
-                        })
-
-                        if random_id:
-                            try:
-                                await self.telegram_client.view_sponsored_message(
-                                    session_id,
-                                    random_id
-                                )
-                                logger.debug(f"    ✓ Marked ad #{idx} as viewed")
-                            except Exception as exc:
-                                logger.warning(f"    ⚠ Failed to mark ad as viewed: {exc}")
-                else:
-                    logger.info(f"📭 No sponsored messages available for {chat_username}")
-            elif "AD_EXPIRED" in str(sponsored_result.get("error", "")):
-                logger.info(f"⏰ Sponsored messages expired for {chat_username}")
-            elif "PREMIUM_ACCOUNT_REQUIRED" in str(sponsored_result.get("error", "")):
-                logger.info("💎 Account is actually premium (server says so)")
-            else:
-                logger.warning(f"⚠ Could not fetch sponsored messages: {sponsored_result.get('error')}")
-        elif not is_premium:
-            logger.info(f"ℹ️ Skipping sponsored ads for chat type '{chat_type or 'unknown'}'")
-        else:
-            logger.info("💎 Premium account - skipping sponsored messages")
 
         # Now join the chat
         result = await self.telegram_client.join_chat(session_id, chat_username)
@@ -297,6 +236,54 @@ class ActionExecutor:
                     logger.warning(f"Could not find account for session {session_id} to update joined status")
             except Exception as exc:
                 logger.error(f"Failed to update joined status in database: {exc}")
+
+            # Запрашиваем рекламу ПОСЛЕ успешного вступления (per Telegram docs)
+            if should_fetch_ads:
+                logger.info("📢 User joined channel - fetching sponsored ads...")
+                sponsored_result = await self.telegram_client.get_sponsored_messages(
+                    session_id,
+                    chat_username
+                )
+
+                if sponsored_result.get("success"):
+                    result_data = sponsored_result.get("result", {})
+                    ad_messages = result_data.get("messages", [])
+
+                    if ad_messages:
+                        logger.info(f"📢 Found {len(ad_messages)} sponsored message(s) for {chat_username}")
+                        for idx, ad in enumerate(ad_messages, 1):
+                            title = ad.get("title", "")
+                            message_text = ad.get("message", "")
+                            url = ad.get("url", "")
+                            button_text = ad.get("button_text", "")
+                            recommended = ad.get("recommended", False)
+                            random_id = ad.get("random_id")
+
+                            logger.info(f"  Ad #{idx}: {title[:50]}..." if len(title) > 50 else f"  Ad #{idx}: {title}")
+
+                            sponsored_ads.append({
+                                "title": title,
+                                "message": message_text,
+                                "url": url,
+                                "button_text": button_text,
+                                "recommended": recommended,
+                                "random_id": random_id
+                            })
+
+                            if random_id:
+                                try:
+                                    await self.telegram_client.view_sponsored_message(session_id, random_id)
+                                    logger.debug(f"    ✓ Marked ad #{idx} as viewed")
+                                except Exception as exc:
+                                    logger.warning(f"    ⚠ Failed to mark ad as viewed: {exc}")
+                    else:
+                        logger.info(f"📭 No sponsored messages available for {chat_username}")
+                elif "AD_EXPIRED" in str(sponsored_result.get("error", "")):
+                    logger.info(f"⏰ Sponsored messages expired for {chat_username}")
+                elif "PREMIUM_ACCOUNT_REQUIRED" in str(sponsored_result.get("error", "")):
+                    logger.info("💎 Account is actually premium (server says so)")
+                else:
+                    logger.warning(f"⚠ Could not fetch sponsored messages: {sponsored_result.get('error')}")
 
         # Add sponsored ads info to result
         if sponsored_ads:
@@ -346,63 +333,10 @@ class ActionExecutor:
 
         chat_type = (action.get("chat_type") or resolved_peer.get("chat_type") or resolved_peer.get("peer_type") or "").lower()
         sponsored_ads = []
+        # По документации Telegram, реклама отображается ПОСЛЕ того как пользователь
+        # прокрутил все сообщения в канале и дошёл до конца.
+        # Поэтому запрашиваем рекламу ПОСЛЕ чтения сообщений, а не до.
         should_fetch_ads = not is_premium and chat_type not in {"group", "supergroup", "private"}
-
-        if should_fetch_ads:
-            logger.info("🎯 Non-premium account - fetching official sponsored messages before reading")
-            sponsored_result = await self.telegram_client.get_sponsored_messages(
-                session_id,
-                chat_username
-            )
-
-            if sponsored_result.get("success"):
-                result_data = sponsored_result.get("result", {})
-                messages = result_data.get("messages", [])
-
-                if messages:
-                    logger.info(f"📢 Found {len(messages)} sponsored message(s) for {chat_username}")
-                    for idx, ad in enumerate(messages, 1):
-                        title = ad.get("title", "")
-                        message = ad.get("message", "")
-                        url = ad.get("url", "")
-                        button_text = ad.get("button_text", "")
-                        recommended = ad.get("recommended", False)
-                        random_id = ad.get("random_id")
-
-                        logger.info(f"  Ad #{idx}:")
-                        logger.info(f"    Title: {title}")
-                        logger.info(f"    Message: {message[:100]}..." if len(message) > 100 else f"    Message: {message}")
-                        logger.info(f"    URL: {url}")
-                        logger.info(f"    Button: {button_text}")
-                        logger.info(f"    Recommended: {recommended}")
-
-                        sponsored_ads.append({
-                            "title": title,
-                            "message": message,
-                            "url": url,
-                            "button_text": button_text,
-                            "recommended": recommended,
-                            "random_id": random_id
-                        })
-
-                        if random_id:
-                            try:
-                                await self.telegram_client.view_sponsored_message(session_id, random_id)
-                                logger.debug(f"    ✓ Marked ad #{idx} as viewed")
-                            except Exception as exc:
-                                logger.warning(f"    ⚠ Failed to mark ad as viewed: {exc}")
-                else:
-                    logger.info(f"📭 No sponsored messages available for {chat_username}")
-            elif "AD_EXPIRED" in str(sponsored_result.get("error", "")):
-                logger.info(f"⏰ Sponsored messages expired for {chat_username}")
-            elif "PREMIUM_ACCOUNT_REQUIRED" in str(sponsored_result.get("error", "")):
-                logger.info("💎 Account is actually premium (server says so)")
-            else:
-                logger.warning(f"⚠ Could not fetch sponsored messages: {sponsored_result.get('error')}")
-        elif not is_premium:
-            logger.info(f"ℹ️ Skipping sponsored ads for chat type '{chat_type or 'unknown'}'")
-        else:
-            logger.info("💎 Premium account - skipping sponsored messages")
 
         unread_count = None
         read_inbox_max_id = 0
@@ -653,6 +587,57 @@ class ActionExecutor:
 
         # mark_history_read уже вызван выше сразу после получения сообщений
         # Это гарантирует что сообщения отмечаются как прочитанные даже если симуляция прервётся
+
+        # По документации Telegram: реклама появляется ПОСЛЕ того как пользователь
+        # прокрутил ниже последнего сообщения в канале
+        # https://core.telegram.org/api/sponsored-messages
+        if should_fetch_ads:
+            logger.info("📢 User scrolled past last message - fetching sponsored ads...")
+            sponsored_result = await self.telegram_client.get_sponsored_messages(
+                session_id,
+                chat_username
+            )
+
+            if sponsored_result.get("success"):
+                result_data = sponsored_result.get("result", {})
+                ad_messages = result_data.get("messages", [])
+
+                if ad_messages:
+                    logger.info(f"📢 Found {len(ad_messages)} sponsored message(s) for {chat_username}")
+                    for idx, ad in enumerate(ad_messages, 1):
+                        title = ad.get("title", "")
+                        message = ad.get("message", "")
+                        url = ad.get("url", "")
+                        button_text = ad.get("button_text", "")
+                        recommended = ad.get("recommended", False)
+                        random_id = ad.get("random_id")
+
+                        logger.info(f"  Ad #{idx}: {title[:50]}..." if len(title) > 50 else f"  Ad #{idx}: {title}")
+
+                        sponsored_ads.append({
+                            "title": title,
+                            "message": message,
+                            "url": url,
+                            "button_text": button_text,
+                            "recommended": recommended,
+                            "random_id": random_id
+                        })
+
+                        # Вызываем viewSponsoredMessage когда пользователь "видит" рекламу
+                        if random_id:
+                            try:
+                                await self.telegram_client.view_sponsored_message(session_id, random_id)
+                                logger.debug(f"    ✓ Marked ad #{idx} as viewed")
+                            except Exception as exc:
+                                logger.warning(f"    ⚠ Failed to mark ad as viewed: {exc}")
+                else:
+                    logger.info(f"📭 No sponsored messages available for {chat_username}")
+            elif "AD_EXPIRED" in str(sponsored_result.get("error", "")):
+                logger.info(f"⏰ Sponsored messages expired for {chat_username}")
+            elif "PREMIUM_ACCOUNT_REQUIRED" in str(sponsored_result.get("error", "")):
+                logger.info("💎 Account is actually premium (server says so)")
+            else:
+                logger.warning(f"⚠ Could not fetch sponsored messages: {sponsored_result.get('error')}")
 
         response = {
             "action": "read_messages",
