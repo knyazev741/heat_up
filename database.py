@@ -965,7 +965,7 @@ def get_relevant_chats(
 
 def update_chat_joined(account_id: int, chat_username: str) -> bool:
     """
-    Mark chat as joined
+    Mark chat as joined and increment joined_channels_count in accounts table
     
     Args:
         account_id: Account ID
@@ -977,6 +977,16 @@ def update_chat_joined(account_id: int, chat_username: str) -> bool:
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
+            
+            # Check if already joined to avoid double-counting
+            cursor.execute(
+                "SELECT is_joined FROM discovered_chats WHERE account_id = ? AND chat_username = ?",
+                (account_id, chat_username)
+            )
+            row = cursor.fetchone()
+            already_joined = row and row[0] == 1
+            
+            # Update discovered_chats
             cursor.execute(
                 """
                 UPDATE discovered_chats 
@@ -985,6 +995,19 @@ def update_chat_joined(account_id: int, chat_username: str) -> bool:
                 """,
                 (datetime.utcnow(), account_id, chat_username)
             )
+            
+            # Increment joined_channels_count in accounts if this is a new join
+            if not already_joined:
+                cursor.execute(
+                    """
+                    UPDATE accounts 
+                    SET joined_channels_count = joined_channels_count + 1
+                    WHERE id = ?
+                    """,
+                    (account_id,)
+                )
+                logger.info(f"Incremented joined_channels_count for account {account_id}")
+            
             conn.commit()
             return True
     except Exception as e:

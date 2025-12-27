@@ -26,8 +26,7 @@ from database import (
     save_warmup_session,
     update_account,
     update_account_stage,
-    should_skip_warmup,
-    wait_for_warmup_delay
+    should_skip_warmup
 )
 from admin_sync import sync_session_statuses, get_last_sync_time, save_last_sync_time
 
@@ -193,6 +192,17 @@ class WarmupScheduler:
             True если нужно прогревать
         """
         
+        # Проверяем задержку для новых сессий - если нужно ждать, пропускаем
+        from database import check_warmup_delay
+        should_wait, delay_until = check_warmup_delay(account)
+        if should_wait and delay_until:
+            wait_hours = (delay_until - datetime.utcnow()).total_seconds() / 3600
+            logger.debug(
+                f"Account {account['session_id'][:8]} has delay until {delay_until.isoformat()} "
+                f"({wait_hours:.2f}h) - skipping"
+            )
+            return False
+        
         last_warmup = account.get("last_warmup_date")
         min_daily = account.get("min_daily_activity", 3)
         max_daily = account.get("max_daily_activity", 6)
@@ -277,8 +287,8 @@ class WarmupScheduler:
                 logger.info("=" * 100)
                 return
             
-            # 1.6. Ожидать задержку для новых сессий (если нужно)
-            await wait_for_warmup_delay(account)
+            # Задержка для новых сессий теперь проверяется в _should_warmup_now(),
+            # поэтому здесь она не нужна - такие сессии не попадут в warmup_account
             
             # 2. Проверить/создать личность
             persona = get_persona(account_id)
@@ -301,11 +311,16 @@ class WarmupScheduler:
             # 3. Обновить пул чатов (если нужно)
             relevant_chats = get_relevant_chats(account_id, limit=15)
             
+            # Считаем только каналы с ВЫСОКОЙ релевантностью (>= 0.5) как "доступные"
+            # Низкорелевантные каналы (< 0.5) не дают пользы для прогрева
+            high_relevance_chats = [c for c in relevant_chats if c.get('relevance_score', 0) >= 0.5]
+            
+            logger.info(f"📊 Chats: {len(relevant_chats)} total, {len(high_relevance_chats)} high relevance (>=0.5)")
+            
             # Проверяем когда последний раз искали каналы (не искать если < 5 дней назад)
             should_search_chats = False
-            if len(relevant_chats) < 5 and persona:
+            if len(high_relevance_chats) < 5 and persona:
                 # Проверяем последний discovered_at
-                from datetime import datetime, timedelta
                 import sqlite3
                 
                 conn = sqlite3.connect('data/sessions.db')

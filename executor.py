@@ -313,7 +313,14 @@ class ActionExecutor:
 
     async def _read_messages(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Read messages in a chat or channel and report unread counts"""
+        Read messages in a chat or channel and report unread counts
+        
+        Features:
+        - Marks messages as read correctly using top_message_id
+        - Random chance to react to messages (10%)
+        - Random chance to save to favorites (5%)
+        - Skip/quick scroll simulation (15%)
+        """
         chat_username = action.get("chat_username") or action.get("channel_username")
         duration = action.get("duration_seconds", 5)
 
@@ -416,23 +423,34 @@ class ActionExecutor:
         messages_texts = []
         last_message_id = 0
         actual_read_time = 0.0
-
-        # Читаем сообщения правильно - с первого непрочитанного
+        reactions_sent = 0
+        messages_saved = 0
+        # Читаем сообщения правильно - с первого непрочитанного к последнему
+        # Это имитирует поведение официального клиента: открыть чат, увидеть где остановились, 
+        # и листать вверх к новым сообщениям
         if unread_count and unread_count > 0:
             # Ограничиваем максимум для безопасности (не более 50 за раз)
             max_messages_to_read = min(unread_count, 50)
             first_unread_id = read_inbox_max_id + 1
             
             logger.info(f"📥 Reading {max_messages_to_read} unread messages starting from #{first_unread_id}...")
+            logger.info(f"   Strategy: fetch from top_message #{top_message_id} going back {max_messages_to_read} messages")
             
-            # Используем низкоуровневый API для чтения с конкретного сообщения
+            # ПРАВИЛЬНЫЙ СПОСОБ как в официальном клиенте:
+            # Используем offset_id = top_message_id + 1 (начинаем после последнего сообщения)
+            # add_offset = 0 - не пропускаем
+            # limit = unread_count - получаем ровно столько, сколько непрочитанных
+            # Это даёт нам последние N сообщений (которые и есть непрочитанные)
             from telegram_tl_helpers import make_get_history_query
             
             query = make_get_history_query(
                 peer=resolved_peer['input_peer'],
-                offset_id=first_unread_id,
+                offset_id=top_message_id + 1,  # Начинаем "после" последнего, чтобы он вошёл в выборку
                 add_offset=0,
-                limit=max_messages_to_read
+                limit=max_messages_to_read,
+                min_id=read_inbox_max_id,  # Только сообщения с ID > read_inbox_max_id (непрочитанные)
+                max_id=0,
+                hash=0
             )
             
             history_result = await self.telegram_client.invoke_raw(session_id, query)
@@ -447,17 +465,54 @@ class ActionExecutor:
                     else:
                         messages = []
 
-                    # Сортируем от старых к новым (как читает человек)
-                    messages_sorted = sorted(messages, key=lambda m: m.get('id', 0))
+                    # ФИЛЬТРУЕМ: только сообщения с ID > read_inbox_max_id (непрочитанные)
+                    unread_messages = [m for m in messages if m.get('id', 0) > read_inbox_max_id]
                     
-                    logger.info(f"📥 Got {len(messages_sorted)} unread messages")
+                    # Сортируем от старых к новым (как читает человек - от первого непрочитанного к последнему)
+                    messages_sorted = sorted(unread_messages, key=lambda m: m.get('id', 0))
+                    
+                    # Детальное логирование для отладки
+                    if messages:
+                        raw_ids = sorted([m.get('id', 0) for m in messages])
+                        logger.info(f"📥 API returned {len(messages)} messages (IDs {raw_ids[0]} - {raw_ids[-1]})")
+                    else:
+                        logger.info(f"📥 API returned 0 messages")
+                    
+                    logger.info(f"   After filtering ID > {read_inbox_max_id}: {len(messages_sorted)} unread messages")
+                    
                     if messages_sorted:
-                        logger.info(f"   Range: #{messages_sorted[0].get('id')} - #{messages_sorted[-1].get('id')}")
+                        logger.info(f"   ✅ Unread range: #{messages_sorted[0].get('id')} - #{messages_sorted[-1].get('id')}")
+                        
+                        # КРИТИЧЕСКИ ВАЖНО: Отмечаем как прочитанное СРАЗУ после получения сообщений
+                        # НЕ ждём завершения симуляции чтения - это гарантирует что mark_read всегда вызовется
+                        mark_up_to_id = top_message_id if top_message_id > 0 else messages_sorted[-1].get('id', 0)
+                        if mark_up_to_id > 0:
+                            mark_result = await self.telegram_client.mark_history_read(session_id, resolved_peer, max_id=mark_up_to_id)
+                            if not mark_result.get("error"):
+                                logger.info(f"   👁️ Marked messages up to #{mark_up_to_id} as read")
+                            else:
+                                logger.warning(f"   ⚠️ Failed to mark as read: {mark_result.get('error')}")
+                        
+                    elif messages:
+                        logger.warning(f"   ⚠️ All {len(messages)} fetched messages were already read (ID <= {read_inbox_max_id})")
+                        logger.warning(f"   This suggests API returned wrong offset. Expected ID > {read_inbox_max_id}")
 
-                    # Читаем сообщения с реалистичным временем
-                    skip_probability = 0.15 if len(messages_sorted) >= 3 else 0
+                    # Параметры случайного поведения
+                    skip_probability = 0.15 if len(messages_sorted) >= 3 else 0  # 15% быстрое пролистывание
+                    react_probability = 0.10  # 10% шанс поставить реакцию (если есть реакции на сообщении)
+                    save_probability = 0.05   # 5% шанс сохранить в избранное (длинные сообщения >200)
+                    save_probability_short = 0.03  # 3% шанс для коротких сообщений
+                    
+                    # ВАЖНО: Ограничиваем время на чтение чтобы успеть вызвать mark_read
+                    time_budget = duration - 2.0  # Оставляем 2 секунды на mark_read
+                    time_budget = max(time_budget, 5.0)  # Минимум 5 секунд на чтение
                     
                     for i, msg in enumerate(messages_sorted):
+                        # Проверяем бюджет времени ПЕРЕД обработкой сообщения
+                        if actual_read_time >= time_budget:
+                            logger.info(f"   ⏱️ Time budget exhausted ({actual_read_time:.1f}s / {time_budget:.1f}s), stopping at msg {i+1}/{len(messages_sorted)}")
+                            break
+                        
                         msg_id = msg.get("id")
                         if isinstance(msg_id, int):
                             last_message_id = max(last_message_id, msg_id)
@@ -466,7 +521,8 @@ class ActionExecutor:
                         text_length = len(msg_text)
                         
                         # Вычисляем время чтения для этого сообщения
-                        if random.random() < skip_probability:
+                        is_skipped = random.random() < skip_probability
+                        if is_skipped:
                             # Быстрое пролистывание - не вникая
                             msg_read_time = random.uniform(0.3, 0.8)
                         else:
@@ -477,7 +533,7 @@ class ActionExecutor:
                             thinking_time = random.uniform(0.5, 2.0)
                             
                             msg_read_time = base_time + reading_time + thinking_time
-                            msg_read_time = min(msg_read_time, 30.0)  # Максимум 30 сек
+                            msg_read_time = min(msg_read_time, 5.0)  # Максимум 5 сек на сообщение
                         
                         actual_read_time += msg_read_time
                         
@@ -495,12 +551,76 @@ class ActionExecutor:
                         
                         # Имитируем чтение этого сообщения
                         await asyncio.sleep(msg_read_time)
+                        
+                        # === ENGAGEMENT FEATURES ===
+                        
+                        # Шанс поставить реакцию (только если не пролистали быстро)
+                        # ВАЖНО: Используем ТОЛЬКО реакции которые уже есть на этом сообщении
+                        if not is_skipped and msg_id and random.random() < react_probability:
+                            try:
+                                # Получаем список реакций из самого сообщения
+                                msg_reactions = msg.get("reactions", {})
+                                available_reactions = []
+                                
+                                # Извлекаем emoji из реакций на сообщении
+                                if isinstance(msg_reactions, dict):
+                                    results = msg_reactions.get("results", [])
+                                    for r in results:
+                                        if isinstance(r, dict):
+                                            reaction = r.get("reaction", {})
+                                            if isinstance(reaction, dict):
+                                                # Может быть reactionEmoji или reactionCustomEmoji
+                                                emoticon = reaction.get("emoticon")
+                                                if emoticon:
+                                                    available_reactions.append(emoticon)
+                                
+                                if available_reactions:
+                                    # Выбираем случайную реакцию из доступных на сообщении
+                                    reaction_emoji = random.choice(available_reactions)
+                                    react_result = await self.telegram_client.send_reaction(
+                                        session_id, chat_username, msg_id, reaction_emoji
+                                    )
+                                    if not react_result.get("error"):
+                                        reactions_sent += 1
+                                        logger.info(f"  💬 Reacted with {reaction_emoji} to msg #{msg_id}")
+                                    else:
+                                        logger.debug(f"  ⚠️ Could not react: {react_result.get('error')}")
+                                else:
+                                    logger.debug(f"  ℹ️ No reactions available on msg #{msg_id}")
+                            except Exception as e:
+                                logger.debug(f"  ⚠️ Reaction failed: {e}")
+                        
+                        # Шанс сохранить в избранное
+                        # 5% для длинных (>200 символов), 3% для коротких
+                        save_chance = save_probability if text_length > 200 else save_probability_short
+                        if not is_skipped and msg_id and text_length > 0 and random.random() < save_chance:
+                            try:
+                                # Пересылаем в Saved Messages (chat_id = "me")
+                                forward_result = await self.telegram_client.invoke_raw(
+                                    session_id,
+                                    f"pylogram.raw.functions.messages.ForwardMessages("
+                                    f"from_peer={resolved_peer['input_peer']!r}, "
+                                    f"id=[{msg_id}], "
+                                    f"to_peer=pylogram.raw.types.InputPeerSelf(), "
+                                    f"random_id=[{random.randint(1, 2**63)}])"
+                                )
+                                if not forward_result.get("error"):
+                                    messages_saved += 1
+                                    logger.info(f"  ⭐ Saved msg #{msg_id} to favorites")
+                                else:
+                                    logger.debug(f"  ⚠️ Could not save: {forward_result.get('error')}")
+                            except Exception as e:
+                                logger.debug(f"  ⚠️ Save failed: {e}")
 
                     if messages_read == 0:
                         logger.info(f"📭 No messages found in {chat_username}")
                     else:
                         avg_time = actual_read_time / messages_read if messages_read > 0 else 0
                         logger.info(f"✅ Read {messages_read} messages in {actual_read_time:.1f}s (avg {avg_time:.1f}s/msg)")
+                        if reactions_sent > 0:
+                            logger.info(f"   💬 Reactions sent: {reactions_sent}")
+                        if messages_saved > 0:
+                            logger.info(f"   ⭐ Messages saved: {messages_saved}")
                         
                 except Exception as exc:
                     logger.error(f"Error parsing messages: {exc}")
@@ -531,14 +651,8 @@ class ActionExecutor:
                 except Exception as exc:
                     logger.error(f"Error reading already-read messages: {exc}")
 
-        marked_read = False
-        if unread_count and unread_count > 0 and last_message_id:
-            mark_result = await self.telegram_client.mark_history_read(session_id, resolved_peer, max_id=last_message_id)
-            if not mark_result.get("error"):
-                marked_read = True
-                logger.info(f"👁️ Marked messages up to #{last_message_id} as read in {chat_username}")
-            else:
-                logger.warning(f"⚠️ Failed to mark history as read: {mark_result.get('error')}")
+        # mark_history_read уже вызван выше сразу после получения сообщений
+        # Это гарантирует что сообщения отмечаются как прочитанные даже если симуляция прервётся
 
         response = {
             "action": "read_messages",
@@ -549,18 +663,20 @@ class ActionExecutor:
             "is_premium": is_premium,
             "unread_count_before": unread_count,
             "messages_read": messages_read,
-            "messages_preview": messages_texts[:3] if messages_texts else []
+            "messages_preview": messages_texts[:3] if messages_texts else [],
+            "reactions_sent": reactions_sent,
+            "messages_saved": messages_saved
         }
         response["channel"] = chat_username  # backward compatibility
 
         if sponsored_ads:
             response["sponsored_ads_count"] = len(sponsored_ads)
             response["sponsored_ads"] = sponsored_ads
-
-        if marked_read:
-            response["marked_read"] = True
+        
+        # mark_history_read вызывается inline выше при обработке сообщений
 
         return response
+
 
     async def _idle(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
         """Simulate idle/break time"""
@@ -860,14 +976,47 @@ class ActionExecutor:
         
         logger.info(f"Forwarding message from {from_chat} to {to_chat}")
         
-        # For now, simulated - would use ForwardMessages TL method
-        await asyncio.sleep(random.uniform(2, 4))
+        # Попробуем взять последнее сообщение из источника
+        try:
+            src_result = await self.telegram_client.get_channel_messages(
+                session_id,
+                from_chat,
+                limit=1
+            )
+        except Exception as exc:
+            logger.error(f"Error fetching source messages for forward: {exc}")
+            return {"error": str(exc)}
+        
+        src_message_text = None
+        if isinstance(src_result, dict) and not src_result.get("error"):
+            messages = src_result.get("result") or src_result.get("messages") or src_result.get("data")
+            if isinstance(messages, list) and messages:
+                msg = messages[0]
+                src_message_text = (msg.get("message") or msg.get("text") or "")[:1000]
+        
+        # Если нет текста, делаем ссылку на источник
+        if not src_message_text:
+            src_message_text = f"Forwarded from {from_chat}"
+        
+        try:
+            send_result = await self.telegram_client.send_message(
+                session_id,
+                to_chat,
+                src_message_text
+            )
+        except Exception as exc:
+            logger.error(f"Error forwarding message: {exc}")
+            return {"error": str(exc)}
+        
+        if send_result.get("error"):
+            return {"error": send_result.get("error"), "success": False}
         
         return {
             "action": "forward_message",
             "from_chat": from_chat,
             "to_chat": to_chat,
-            "status": "completed"
+            "status": "completed",
+            "message_preview": src_message_text[:120]
         }
     
     async def _update_privacy(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
@@ -913,4 +1062,3 @@ class ActionExecutor:
             delay += random.uniform(5, 10)
         
         return round(delay, 2)
-
