@@ -564,6 +564,7 @@ class ActionExecutor:
                 logger.warning(f"⚠️ Could not fetch messages from {chat_username}: {error_msg}")
         else:
             # Нет непрочитанных - просто читаем последние для вида
+            # Но всё равно можем реагировать и сохранять!
             logger.info(f"✅ All messages already read in {chat_username}")
             history_result = await self.telegram_client.get_chat_history(session_id, resolved_peer, limit=5)
             
@@ -572,16 +573,81 @@ class ActionExecutor:
                     result_data = history_result.get("result") or {}
                     messages = result_data.get("messages", []) if isinstance(result_data, dict) else []
                     
-                    for msg in messages[:3]:
+                    # Параметры engagement для уже прочитанных сообщений
+                    react_probability = 0.10  # 10% шанс поставить реакцию
+                    save_probability = 0.05   # 5% шанс сохранить длинное
+                    save_probability_short = 0.03  # 3% для короткого
+                    
+                    for msg in messages[:5]:
                         msg_id = msg.get("id")
                         if isinstance(msg_id, int):
                             last_message_id = max(last_message_id, msg_id)
                         msg_text = msg.get("message") or msg.get("text", "")
+                        text_length = len(msg_text)
+                        
                         if msg_text:
                             messages_texts.append(msg_text[:200])
-                            
-                    # Минимальное время для вида
-                    await asyncio.sleep(random.uniform(2, 5))
+                            messages_read += 1
+                        
+                        # Симуляция просмотра: 1-3 секунды на сообщение
+                        await asyncio.sleep(random.uniform(1, 3))
+                        
+                        # === ENGAGEMENT для уже прочитанных сообщений ===
+                        
+                        # Шанс поставить реакцию
+                        if msg_id and random.random() < react_probability:
+                            try:
+                                msg_reactions = msg.get("reactions", {})
+                                available_reactions = []
+                                
+                                if isinstance(msg_reactions, dict):
+                                    results = msg_reactions.get("results", [])
+                                    for r in results:
+                                        if isinstance(r, dict):
+                                            reaction = r.get("reaction", {})
+                                            if isinstance(reaction, dict):
+                                                emoticon = reaction.get("emoticon")
+                                                if emoticon:
+                                                    available_reactions.append(emoticon)
+                                
+                                if available_reactions:
+                                    reaction_emoji = random.choice(available_reactions)
+                                    react_result = await self.telegram_client.send_reaction(
+                                        session_id, chat_username, msg_id, reaction_emoji
+                                    )
+                                    if not react_result.get("error"):
+                                        reactions_sent += 1
+                                        logger.info(f"  💬 Reacted with {reaction_emoji} to msg #{msg_id}")
+                                    else:
+                                        logger.debug(f"  ⚠️ Could not react: {react_result.get('error')}")
+                                else:
+                                    logger.debug(f"  ℹ️ No reactions available on msg #{msg_id}")
+                            except Exception as e:
+                                logger.debug(f"  ⚠️ Reaction failed: {e}")
+                        
+                        # Шанс сохранить в избранное
+                        save_chance = save_probability if text_length > 200 else save_probability_short
+                        if msg_id and text_length > 0 and random.random() < save_chance:
+                            try:
+                                forward_result = await self.telegram_client.invoke_raw(
+                                    session_id,
+                                    f"pylogram.raw.functions.messages.ForwardMessages("
+                                    f"from_peer={resolved_peer['input_peer']!r}, "
+                                    f"id=[{msg_id}], "
+                                    f"to_peer=pylogram.raw.types.InputPeerSelf(), "
+                                    f"random_id=[{random.randint(1, 2**63)}])"
+                                )
+                                if not forward_result.get("error"):
+                                    messages_saved += 1
+                                    logger.info(f"  ⭐ Saved msg #{msg_id} to favorites")
+                                else:
+                                    logger.debug(f"  ⚠️ Could not save: {forward_result.get('error')}")
+                            except Exception as e:
+                                logger.debug(f"  ⚠️ Save failed: {e}")
+                    
+                    if reactions_sent > 0 or messages_saved > 0:
+                        logger.info(f"   📊 Engagement on re-read: {reactions_sent} reactions, {messages_saved} saves")
+                        
                 except Exception as exc:
                     logger.error(f"Error reading already-read messages: {exc}")
 
