@@ -213,7 +213,7 @@ class TelegramAPIClient:
         emoji: str = "👍"
     ) -> Dict[str, Any]:
         """
-        Send a reaction to a message
+        Send a reaction to a message using raw TL method
         
         Args:
             session_id: Telegram session UID
@@ -224,30 +224,33 @@ class TelegramAPIClient:
         Returns:
             API response
         """
-        url = f"{self.base_url}/api/external/sessions/{session_id}/rpc/send_reaction"
-        payload = {
-            "method": "send_reaction",
-            "params": {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "emoji": emoji,
-                "big": False
-            }
-        }
-        
         logger.info(f"Sending reaction {emoji} to message {message_id} in {chat_id}")
         
+        # First resolve the peer to get InputPeer
+        peer_info = await self.resolve_peer(session_id, chat_id)
+        if not peer_info.get("success"):
+            return {"error": f"Could not resolve peer: {peer_info.get('error')}"}
+        
+        input_peer = peer_info.get("input_peer")
+        if not input_peer:
+            return {"error": "No input_peer in resolved peer info"}
+        
+        # Build raw TL query for SendReaction
+        # Using pylogram.raw.functions.messages.SendReaction
+        query = (
+            f"pylogram.raw.functions.messages.SendReaction("
+            f"peer={input_peer!r}, "
+            f"msg_id={message_id}, "
+            f"reaction=[pylogram.raw.types.ReactionEmoji(emoticon='{emoji}')])"
+        )
+        
         try:
-            response = await self.client.post(
-                url,
-                json=payload,
-                headers=self._get_headers()
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Failed to send reaction: {e.response.text}")
-            return {"error": str(e), "status_code": e.response.status_code}
+            result = await self.invoke_raw(session_id, query)
+            if result.get("error"):
+                logger.error(f"Failed to send reaction: {result.get('error')}")
+                return result
+            logger.info(f"✅ Reaction {emoji} sent to msg #{message_id}")
+            return {"success": True, "result": result}
         except Exception as e:
             logger.error(f"Error sending reaction: {str(e)}")
             return {"error": str(e)}

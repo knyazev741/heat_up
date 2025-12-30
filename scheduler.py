@@ -317,9 +317,21 @@ class WarmupScheduler:
             
             logger.info(f"📊 Chats: {len(relevant_chats)} total, {len(high_relevance_chats)} high relevance (>=0.5)")
             
-            # Проверяем когда последний раз искали каналы (не искать если < 5 дней назад)
+            # Проверяем когда последний раз искали каналы
+            # Время ожидания зависит от количества релевантных каналов:
+            # 0 каналов = 1 день, 1-2 = 2 дня, 3-4 = 3 дня, 5+ = 5 дней
             should_search_chats = False
             if len(high_relevance_chats) < 5 and persona:
+                # Вычисляем минимальное время ожидания
+                if len(high_relevance_chats) == 0:
+                    min_days_wait = 1  # Критично мало каналов - искать через 1 день
+                elif len(high_relevance_chats) <= 2:
+                    min_days_wait = 2  # Мало каналов - искать через 2 дня
+                elif len(high_relevance_chats) <= 4:
+                    min_days_wait = 3  # Почти достаточно - искать через 3 дня
+                else:
+                    min_days_wait = 5  # Нормально - стандартные 5 дней
+                
                 # Проверяем последний discovered_at
                 import sqlite3
                 
@@ -337,11 +349,12 @@ class WarmupScheduler:
                     last_search = datetime.fromisoformat(row[0])
                     days_since_search = (datetime.utcnow() - last_search).days
                     
-                    if days_since_search >= 5:
-                        logger.info(f"📅 Last search was {days_since_search} days ago - will search again")
+                    if days_since_search >= min_days_wait:
+                        logger.info(f"📅 Last search was {days_since_search} days ago (need {min_days_wait} for {len(high_relevance_chats)} rel chats) - will search")
                         should_search_chats = True
                     else:
-                        logger.info(f"⏳ Last search was {days_since_search} days ago - skipping (wait {5 - days_since_search} more days)")
+                        wait_more = min_days_wait - days_since_search
+                        logger.info(f"⏳ Last search was {days_since_search} days ago - wait {wait_more} more days (have {len(high_relevance_chats)} rel chats)")
                 else:
                     # Никогда не искали - можно искать
                     logger.info("🆕 Never searched for chats - will search now")
