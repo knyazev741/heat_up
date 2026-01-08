@@ -438,6 +438,73 @@ def init_database():
             ON bot_group_messages(group_id, sent_at)
         """)
 
+        # =====================================================
+        # Phase 2: Real group chat participation tables
+        # =====================================================
+
+        # Cache of recent messages from real public chats (for context analysis)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS real_chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_username TEXT NOT NULL,
+
+                telegram_message_id INTEGER NOT NULL,
+                sender_name TEXT,
+                sender_id INTEGER,
+                message_text TEXT,
+                message_type TEXT DEFAULT 'text',
+
+                fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                message_date DATETIME,
+
+                UNIQUE(chat_username, telegram_message_id)
+            )
+        """)
+
+        # Track participation in real public chats
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS real_chat_participation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                chat_username TEXT NOT NULL,
+
+                -- Statistics
+                messages_sent INTEGER DEFAULT 0,
+                reactions_sent INTEGER DEFAULT 0,
+                messages_read INTEGER DEFAULT 0,
+
+                -- Last activity
+                last_message_at DATETIME,
+                last_read_at DATETIME,
+                last_reaction_at DATETIME,
+
+                -- Context analysis
+                last_analyzed_at DATETIME,
+                analysis_result TEXT,  -- JSON with last analysis
+
+                -- Limits
+                daily_message_limit INTEGER DEFAULT 3,
+                messages_sent_today INTEGER DEFAULT 0,
+                last_limit_reset DATETIME,
+
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+                FOREIGN KEY (account_id) REFERENCES accounts(id),
+                UNIQUE(account_id, chat_username)
+            )
+        """)
+
+        # Indexes for real chat tables
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_real_chat_messages_chat
+            ON real_chat_messages(chat_username, fetched_at)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_real_chat_participation_account
+            ON real_chat_participation(account_id, chat_username)
+        """)
+
         conn.commit()
 
     logger.info("Database initialized successfully")
@@ -1158,21 +1225,23 @@ def get_relevant_chats(
         return []
 
 
-def update_chat_joined(account_id: int, chat_username: str) -> bool:
+def update_chat_joined(account_id: int, chat_username: str, chat_type: str = None) -> bool:
     """
-    Mark chat as joined and increment joined_channels_count in accounts table
-    
+    Mark chat as joined and increment joined_channels_count in accounts table.
+    Also updates chat_type if provided (to fix incorrect types from search).
+
     Args:
         account_id: Account ID
         chat_username: Chat username
-        
+        chat_type: Real chat type from Telegram API (supergroup, channel, group)
+
     Returns:
         True if successful
     """
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            
+
             # Check if already joined to avoid double-counting
             cursor.execute(
                 "SELECT is_joined FROM discovered_chats WHERE account_id = ? AND chat_username = ?",
@@ -1180,16 +1249,26 @@ def update_chat_joined(account_id: int, chat_username: str) -> bool:
             )
             row = cursor.fetchone()
             already_joined = row and row[0] == 1
-            
-            # Update discovered_chats
-            cursor.execute(
-                """
-                UPDATE discovered_chats 
-                SET is_joined = 1, joined_at = ?
-                WHERE account_id = ? AND chat_username = ?
-                """,
-                (datetime.utcnow(), account_id, chat_username)
-            )
+
+            # Update discovered_chats with correct chat_type
+            if chat_type:
+                cursor.execute(
+                    """
+                    UPDATE discovered_chats
+                    SET is_joined = 1, joined_at = ?, chat_type = ?
+                    WHERE account_id = ? AND chat_username = ?
+                    """,
+                    (datetime.utcnow(), chat_type, account_id, chat_username)
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE discovered_chats
+                    SET is_joined = 1, joined_at = ?
+                    WHERE account_id = ? AND chat_username = ?
+                    """,
+                    (datetime.utcnow(), account_id, chat_username)
+                )
             
             # Increment joined_channels_count in accounts if this is a new join
             if not already_joined:
@@ -2272,6 +2351,69 @@ def count_active_bot_groups() -> int:
         return 0
 
 
+def is_private_bot_group(chat_identifier: str) -> bool:
+    """
+    Check if a chat is a private bot group (not a real public chat).
+
+    Private bot groups are identified by:
+    - telegram_chat_id (integer)
+    - telegram_invite_link
+
+    Real public chats have @username format.
+
+    Args:
+        chat_identifier: Chat username, ID, or invite link
+
+    Returns:
+        True if it's a private bot group, False if it's a real public chat
+    """
+    if not chat_identifier:
+        return False
+
+    # If it starts with @, it's a public chat username
+    if chat_identifier.startswith("@"):
+        return False
+
+    # If it's an invite link (t.me/+xxx or t.me/joinchat/xxx), check bot_groups
+    if "t.me/" in chat_identifier or chat_identifier.startswith("+"):
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT 1 FROM bot_groups
+                    WHERE telegram_invite_link LIKE ?
+                    AND status = 'active'
+                    LIMIT 1
+                    """,
+                    (f"%{chat_identifier}%",)
+                )
+                return cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"Error checking bot group by invite link: {e}")
+            return False
+
+    # If it's a numeric ID, check bot_groups
+    try:
+        chat_id = int(chat_identifier)
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT 1 FROM bot_groups
+                WHERE telegram_chat_id = ?
+                AND status = 'active'
+                LIMIT 1
+                """,
+                (chat_id,)
+            )
+            return cursor.fetchone() is not None
+    except (ValueError, TypeError):
+        pass
+
+    return False
+
+
 def get_accounts_without_group_membership(
     min_stage: int = MIN_STAGE_FOR_DM,
     limit: int = 20,
@@ -2363,4 +2505,488 @@ def count_helper_accounts() -> int:
     except Exception as e:
         logger.error(f"Error counting helper accounts: {e}")
         return 0
+
+
+# ============================================
+# REAL CHAT PARTICIPATION CRUD (Phase 2)
+# ============================================
+
+def cache_real_chat_messages(
+    chat_username: str,
+    messages: List[Dict[str, Any]]
+) -> int:
+    """
+    Cache messages from a real public chat for context analysis.
+
+    Args:
+        chat_username: Chat username (e.g., @example)
+        messages: List of message dicts with id, text, sender_name, etc.
+
+    Returns:
+        Number of messages cached
+    """
+    if not messages:
+        return 0
+
+    cached = 0
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            for msg in messages:
+                try:
+                    cursor.execute(
+                        """
+                        INSERT OR REPLACE INTO real_chat_messages (
+                            chat_username, telegram_message_id, sender_name,
+                            sender_id, message_text, message_type,
+                            message_date, fetched_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            chat_username,
+                            msg.get('id'),
+                            msg.get('sender_name') or msg.get('from_name'),
+                            msg.get('sender_id') or msg.get('from_id'),
+                            msg.get('text') or msg.get('message'),
+                            msg.get('type', 'text'),
+                            msg.get('date'),
+                            datetime.utcnow()
+                        )
+                    )
+                    cached += 1
+                except Exception as e:
+                    logger.debug(f"Error caching message {msg.get('id')}: {e}")
+
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error caching real chat messages: {e}")
+
+    return cached
+
+
+def get_cached_chat_messages(
+    chat_username: str,
+    limit: int = 30,
+    max_age_hours: int = 24
+) -> List[Dict[str, Any]]:
+    """
+    Get cached messages from a real chat.
+
+    Args:
+        chat_username: Chat username
+        limit: Max messages to return
+        max_age_hours: Only return messages fetched within this time
+
+    Returns:
+        List of message dicts
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            cutoff = datetime.utcnow() - timedelta(hours=max_age_hours)
+
+            cursor.execute(
+                """
+                SELECT * FROM real_chat_messages
+                WHERE chat_username = ?
+                AND fetched_at > ?
+                ORDER BY telegram_message_id DESC
+                LIMIT ?
+                """,
+                (chat_username, cutoff, limit)
+            )
+
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting cached chat messages: {e}")
+        return []
+
+
+def get_or_create_chat_participation(
+    account_id: int,
+    chat_username: str
+) -> Dict[str, Any]:
+    """
+    Get or create participation record for an account in a chat.
+
+    Args:
+        account_id: Account ID
+        chat_username: Chat username
+
+    Returns:
+        Participation record dict
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT * FROM real_chat_participation
+                WHERE account_id = ? AND chat_username = ?
+                """,
+                (account_id, chat_username)
+            )
+
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+
+            # Create new record
+            cursor.execute(
+                """
+                INSERT INTO real_chat_participation (
+                    account_id, chat_username, created_at
+                ) VALUES (?, ?, ?)
+                """,
+                (account_id, chat_username, datetime.utcnow())
+            )
+            conn.commit()
+
+            return {
+                "id": cursor.lastrowid,
+                "account_id": account_id,
+                "chat_username": chat_username,
+                "messages_sent": 0,
+                "reactions_sent": 0,
+                "messages_read": 0,
+                "messages_sent_today": 0,
+                "daily_message_limit": 3
+            }
+    except Exception as e:
+        logger.error(f"Error getting/creating chat participation: {e}")
+        return {}
+
+
+def update_chat_participation(
+    account_id: int,
+    chat_username: str,
+    **kwargs
+) -> bool:
+    """
+    Update chat participation record.
+
+    Args:
+        account_id: Account ID
+        chat_username: Chat username
+        **kwargs: Fields to update
+
+    Returns:
+        True if successful
+    """
+    if not kwargs:
+        return True
+
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            # Ensure record exists
+            get_or_create_chat_participation(account_id, chat_username)
+
+            fields = []
+            values = []
+            for key, value in kwargs.items():
+                fields.append(f"{key} = ?")
+                if isinstance(value, datetime):
+                    values.append(value.isoformat())
+                elif isinstance(value, dict):
+                    values.append(json.dumps(value))
+                else:
+                    values.append(value)
+
+            values.extend([account_id, chat_username])
+
+            cursor.execute(
+                f"""
+                UPDATE real_chat_participation
+                SET {', '.join(fields)}
+                WHERE account_id = ? AND chat_username = ?
+                """,
+                values
+            )
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error updating chat participation: {e}")
+        return False
+
+
+def increment_chat_messages_sent(account_id: int, chat_username: str) -> bool:
+    """
+    Increment messages sent counter for a chat.
+
+    Args:
+        account_id: Account ID
+        chat_username: Chat username
+
+    Returns:
+        True if successful
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            # Ensure record exists
+            get_or_create_chat_participation(account_id, chat_username)
+
+            # Reset daily counter if needed
+            cursor.execute(
+                """
+                UPDATE real_chat_participation
+                SET messages_sent_today = 0, last_limit_reset = ?
+                WHERE account_id = ? AND chat_username = ?
+                AND (last_limit_reset IS NULL OR date(last_limit_reset) < date('now'))
+                """,
+                (datetime.utcnow(), account_id, chat_username)
+            )
+
+            # Increment counters
+            cursor.execute(
+                """
+                UPDATE real_chat_participation
+                SET messages_sent = messages_sent + 1,
+                    messages_sent_today = messages_sent_today + 1,
+                    last_message_at = ?
+                WHERE account_id = ? AND chat_username = ?
+                """,
+                (datetime.utcnow(), account_id, chat_username)
+            )
+
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error incrementing chat messages sent: {e}")
+        return False
+
+
+def get_joined_supergroups_count(account_id: int) -> int:
+    """
+    Count how many supergroups the account has joined.
+
+    Used to enforce the max_supergroups_per_account limit.
+
+    Args:
+        account_id: Account ID
+
+    Returns:
+        Number of joined supergroups
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM discovered_chats
+                WHERE account_id = ?
+                AND is_joined = 1
+                AND chat_type = 'supergroup'
+                """,
+                (account_id,)
+            )
+            result = cursor.fetchone()
+            return result[0] if result else 0
+    except Exception as e:
+        logger.error(f"Error counting joined supergroups: {e}")
+        return 0
+
+
+def can_join_supergroup(account_id: int, warmup_stage: int) -> tuple[bool, str]:
+    """
+    Check if account can join another supergroup.
+
+    Limits are stage-based:
+    - Stage 10: up to 5 supergroups
+    - Stage 11: up to 7 supergroups
+    - Stage 12: up to 10 supergroups
+    - Stage 13: up to 12 supergroups
+    - Stage 14: up to 15 supergroups (max)
+
+    Args:
+        account_id: Account ID
+        warmup_stage: Current warmup stage
+
+    Returns:
+        Tuple of (can_join, reason)
+    """
+    from config import CHAT_LIMITS
+
+    # Check warmup stage
+    min_stage = CHAT_LIMITS.get("min_stage_to_join_supergroups", 10)
+    if warmup_stage < min_stage:
+        return False, f"Account at stage {warmup_stage}, need stage {min_stage} to join supergroups"
+
+    # Get stage-based limit
+    stage_limits = CHAT_LIMITS.get("supergroups_by_stage", {})
+    max_count = stage_limits.get(warmup_stage, CHAT_LIMITS.get("max_supergroups_per_account", 15))
+
+    # Check total count
+    current_count = get_joined_supergroups_count(account_id)
+
+    if current_count >= max_count:
+        return False, f"Account has {current_count} supergroups (max {max_count} at stage {warmup_stage})"
+
+    return True, f"Can join ({current_count}/{max_count} supergroups at stage {warmup_stage})"
+
+
+def can_send_message_in_chat(account_id: int, chat_username: str) -> bool:
+    """
+    Check if account can send a message in a chat (based on daily limit).
+
+    Args:
+        account_id: Account ID
+        chat_username: Chat username
+
+    Returns:
+        True if can send message
+    """
+    try:
+        participation = get_or_create_chat_participation(account_id, chat_username)
+
+        if not participation:
+            return True  # No record = no limit reached
+
+        limit = participation.get('daily_message_limit', 3)
+        sent_today = participation.get('messages_sent_today', 0)
+
+        # Check if limit needs reset
+        last_reset = participation.get('last_limit_reset')
+        if last_reset:
+            if isinstance(last_reset, str):
+                last_reset = datetime.fromisoformat(last_reset)
+            if last_reset.date() < datetime.utcnow().date():
+                return True  # New day, limit reset
+
+        return sent_today < limit
+    except Exception as e:
+        logger.error(f"Error checking chat message limit: {e}")
+        return True  # Allow on error
+
+
+def get_chats_for_participation(
+    account_id: int,
+    min_relevance: float = 0.6,
+    limit: int = 5
+) -> List[Dict[str, Any]]:
+    """
+    Get joined chats where account can actively participate.
+
+    Returns groups (not channels) with high relevance where
+    the account hasn't exceeded daily message limits.
+
+    Args:
+        account_id: Account ID
+        min_relevance: Minimum relevance score
+        limit: Max chats to return
+
+    Returns:
+        List of chat dicts with participation stats
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT
+                    dc.*,
+                    rcp.messages_sent,
+                    rcp.messages_sent_today,
+                    rcp.daily_message_limit,
+                    rcp.last_message_at,
+                    rcp.last_analyzed_at
+                FROM discovered_chats dc
+                LEFT JOIN real_chat_participation rcp
+                    ON rcp.account_id = dc.account_id
+                    AND rcp.chat_username = dc.chat_username
+                WHERE dc.account_id = ?
+                AND dc.is_joined = 1
+                AND dc.is_active = 1
+                AND dc.relevance_score >= ?
+                AND dc.chat_type IN ('group', 'supergroup')
+                AND (
+                    rcp.id IS NULL
+                    OR rcp.messages_sent_today < rcp.daily_message_limit
+                    OR date(rcp.last_limit_reset) < date('now')
+                )
+                ORDER BY dc.relevance_score DESC, dc.last_activity_at DESC
+                LIMIT ?
+                """,
+                (account_id, min_relevance, limit)
+            )
+
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting chats for participation: {e}")
+        return []
+
+
+def get_accounts_eligible_for_real_chat_participation(
+    min_stage: int = 8,
+    limit: int = 20
+) -> List[Dict[str, Any]]:
+    """
+    Get accounts eligible for participating in real public chats.
+
+    Requirements:
+    - Warmup stage >= 8 (advanced stage)
+    - Has joined relevant chats (groups)
+    - Not frozen/deleted
+
+    Args:
+        min_stage: Minimum warmup stage
+        limit: Max accounts to return
+
+    Returns:
+        List of account dicts with persona data
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT DISTINCT
+                    a.*,
+                    p.generated_name, p.age, p.occupation,
+                    p.interests, p.communication_style, p.personality_traits,
+                    COUNT(dc.id) as joined_groups_count
+                FROM accounts a
+                LEFT JOIN personas p ON a.id = p.account_id
+                LEFT JOIN discovered_chats dc ON dc.account_id = a.id
+                    AND dc.is_joined = 1
+                    AND dc.chat_type IN ('group', 'supergroup')
+                WHERE a.account_type = 'warmup'
+                AND a.is_active = 1
+                AND a.is_deleted = 0
+                AND a.is_frozen = 0
+                AND a.warmup_stage >= ?
+                GROUP BY a.id
+                HAVING joined_groups_count > 0
+                ORDER BY a.warmup_stage DESC, RANDOM()
+                LIMIT ?
+                """,
+                (min_stage, limit)
+            )
+
+            rows = cursor.fetchall()
+            accounts = []
+            for row in rows:
+                acc = dict(row)
+                # Parse JSON fields
+                for field in ['interests', 'personality_traits']:
+                    if acc.get(field):
+                        try:
+                            acc[field] = json.loads(acc[field])
+                        except:
+                            pass
+                accounts.append(acc)
+            return accounts
+    except Exception as e:
+        logger.error(f"Error getting accounts for real chat participation: {e}")
+        return []
 

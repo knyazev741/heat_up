@@ -219,6 +219,33 @@ class ActionExecutor:
         # Рекламу запрашиваем ПОСЛЕ вступления в канал (per Telegram docs)
         should_fetch_ads = not is_premium and chat_type not in {"group", "supergroup", "private"}
 
+        # Check supergroup limits before joining
+        if chat_type in {"group", "supergroup"}:
+            # Resolve peer to determine exact type (megagroup = supergroup)
+            try:
+                peer_result = await self.telegram_client.resolve_peer(session_id, chat_username)
+                if peer_result.get("success"):
+                    chat_data = peer_result.get("chat_data", {})
+                    if chat_data.get("megagroup"):
+                        # This is a supergroup - check limits
+                        from database import get_account, can_join_supergroup
+                        account = get_account(session_id)
+                        if account:
+                            account_id = account['id']
+                            warmup_stage = account.get('warmup_stage', 0)
+                            can_join, reason = can_join_supergroup(account_id, warmup_stage)
+                            if not can_join:
+                                logger.info(f"🚫 Cannot join supergroup {chat_username}: {reason}")
+                                return {
+                                    "action": "join_channel",
+                                    "status": "skipped",
+                                    "reason": reason,
+                                    "chat_type": "supergroup"
+                                }
+                            logger.info(f"✅ Supergroup join allowed: {reason}")
+            except Exception as exc:
+                logger.warning(f"Could not check supergroup limits: {exc}")
+
         # Now join the chat
         result = await self.telegram_client.join_chat(session_id, chat_username)
 
@@ -226,14 +253,28 @@ class ActionExecutor:
             self.joined_channels.add(chat_username)
             logger.info(f"Successfully joined {chat_username}")
 
-            # Update database - mark chat as joined
+            # Get accurate chat_type from resolve_peer (megagroup/broadcast)
+            real_chat_type = chat_type  # fallback to resolved type
+            try:
+                peer_result = await self.telegram_client.resolve_peer(session_id, chat_username)
+                if peer_result.get("success"):
+                    chat_data = peer_result.get("chat_data", {})
+                    if chat_data.get("megagroup"):
+                        real_chat_type = "supergroup"
+                    elif chat_data.get("broadcast"):
+                        real_chat_type = "channel"
+                    logger.info(f"📋 Detected real chat type: {real_chat_type}")
+            except Exception as exc:
+                logger.warning(f"Could not detect real chat type: {exc}")
+
+            # Update database - mark chat as joined with correct type
             try:
                 from database import get_account, update_chat_joined
                 account = get_account(session_id)
                 if account:
                     account_id = account['id']
-                    update_chat_joined(account_id, chat_username)
-                    logger.info(f"✅ Marked {chat_username} as joined in database")
+                    update_chat_joined(account_id, chat_username, real_chat_type)
+                    logger.info(f"✅ Marked {chat_username} as joined (type: {real_chat_type})")
                 else:
                     logger.warning(f"Could not find account for session {session_id} to update joined status")
             except Exception as exc:
@@ -962,22 +1003,155 @@ class ActionExecutor:
         }
     
     async def _reply_in_chat(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Reply to a message in a chat"""
+        """
+        Reply to a message in a chat with context-aware response.
+
+        Phase 2 enhanced version:
+        - Analyzes chat context before responding
+        - Generates contextual response if not provided
+        - Tracks participation statistics
+        - Only allows status=0 accounts to write to real public chats
+        """
+        from database import (
+            get_account, update_account, get_persona,
+            can_send_message_in_chat, increment_chat_messages_sent,
+            is_private_bot_group
+        )
+        from chat_context_analyzer import ChatContextAnalyzer
+        from admin_api_client import AdminAPIClient
+
         chat_username = action.get("chat_username")
         reply_text = action.get("reply_text", "")
-        
+        use_context_analysis = action.get("use_context_analysis", True)
+
         if not chat_username:
             return {"error": "Missing chat_username"}
-        
+
+        account = get_account(session_id)
+        if not account:
+            return {"error": "Account not found"}
+
+        # Check if this is a real public chat (not a private bot group)
+        # Only accounts with status=0 in Admin API can write to real public chats
+        if not is_private_bot_group(chat_username):
+            try:
+                admin_api = AdminAPIClient()
+                status = await admin_api.check_session_status(session_id)
+
+                if status != 0:
+                    logger.info(
+                        f"Cannot reply in real chat {chat_username}: "
+                        f"session {session_id} has status={status} (need status=0)"
+                    )
+                    return {
+                        "action": "reply_in_chat",
+                        "chat": chat_username,
+                        "status": "skipped",
+                        "reason": f"Account status={status}, only status=0 can write to real public chats"
+                    }
+            except Exception as e:
+                logger.warning(f"Admin API check failed for {session_id}: {e}")
+                # Be conservative - don't allow if we can't verify
+                return {
+                    "action": "reply_in_chat",
+                    "chat": chat_username,
+                    "status": "skipped",
+                    "reason": f"Could not verify account status in Admin API: {e}"
+                }
+
+        account_id = account.get("id")
+
+        # Check daily limit for real chats
+        if not can_send_message_in_chat(account_id, chat_username):
+            logger.info(f"Daily message limit reached for {chat_username}")
+            return {
+                "action": "reply_in_chat",
+                "chat": chat_username,
+                "status": "skipped",
+                "reason": "Daily message limit reached"
+            }
+
+        # If no reply text provided and context analysis enabled, generate one
+        if not reply_text and use_context_analysis:
+            logger.info(f"Generating contextual response for {chat_username}...")
+
+            try:
+                # Get persona for context
+                persona = get_persona(account_id) or {}
+
+                # Fetch recent messages
+                resolved = await self.telegram_client.resolve_peer(session_id, chat_username)
+                if not resolved.get("success"):
+                    return {"error": f"Could not resolve chat {chat_username}"}
+
+                history = await self.telegram_client.get_chat_history(
+                    session_id=session_id,
+                    peer_info=resolved,
+                    limit=30
+                )
+
+                if history.get("error"):
+                    return {"error": f"Could not fetch chat history: {history.get('error')}"}
+
+                # Parse messages
+                messages = self._parse_chat_messages(history.get("result", {}))
+
+                if len(messages) < 5:
+                    return {
+                        "action": "reply_in_chat",
+                        "chat": chat_username,
+                        "status": "skipped",
+                        "reason": "Not enough messages for context"
+                    }
+
+                # Analyze context
+                analyzer = ChatContextAnalyzer()
+                analysis = await analyzer.analyze_chat_context(
+                    messages=messages,
+                    persona=persona
+                )
+
+                if not analysis.get("should_respond"):
+                    logger.info(f"Context analysis: should not respond in {chat_username}")
+                    return {
+                        "action": "reply_in_chat",
+                        "chat": chat_username,
+                        "status": "skipped",
+                        "reason": analysis.get("reason", "Context analysis declined")
+                    }
+
+                # Get response from analysis or generate new
+                reply_text = analysis.get("suggested_response")
+                if not reply_text:
+                    reply_text = await analyzer.generate_contextual_response(
+                        messages=messages,
+                        persona=persona,
+                        topic_hint=analysis.get("topic")
+                    )
+
+                if not reply_text:
+                    return {
+                        "action": "reply_in_chat",
+                        "chat": chat_username,
+                        "status": "skipped",
+                        "reason": "Could not generate contextual response"
+                    }
+
+            except Exception as e:
+                logger.error(f"Error in context analysis: {e}")
+                # Fallback to generic response
+                reply_text = "Интересно! Спасибо за информацию."
+
+        # Fallback if still no text
         if not reply_text:
-            reply_text = "Interesting! Thanks for sharing."
-        
+            reply_text = "Интересно! Спасибо за информацию."
+
         logger.info(f"Replying in {chat_username}: {reply_text[:50]}...")
-        
-        # Check for FloodWait keywords in reply
+
+        # Check for spam keywords
         if self._check_floodwait_keywords(reply_text):
             return {"error": "Reply text contains potential spam keywords"}
-        
+
         try:
             # Send the message
             result = await self.telegram_client.send_message(
@@ -986,23 +1160,75 @@ class ActionExecutor:
                 reply_text,
                 disable_notification=True
             )
-            
+
             # Check for FloodWait error
             if result.get("error"):
                 error_text = str(result.get("error", "")).lower()
                 if "flood" in error_text or "wait" in error_text:
                     logger.error(f"⚠️ FLOODWAIT DETECTED for session {session_id}")
                     self._in_floodwait = True
-                    from database import update_account
-                    from database import get_account
-                    account = get_account(session_id)
-                    if account:
-                        update_account(session_id, is_frozen=True)
-            
-            return result
+                    update_account(session_id, is_frozen=True)
+                return result
+
+            # Success - update statistics
+            increment_chat_messages_sent(account_id, chat_username)
+
+            return {
+                "action": "reply_in_chat",
+                "chat": chat_username,
+                "status": "sent",
+                "message_preview": reply_text[:50],
+                "telegram_result": result
+            }
+
         except Exception as e:
             logger.error(f"Error replying in chat: {e}")
             return {"error": str(e)}
+
+    def _parse_chat_messages(self, result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Parse messages from Telegram API response for context analysis"""
+        messages = []
+
+        raw_messages = result.get("messages", [])
+        if isinstance(result, list):
+            raw_messages = result
+
+        users = {}
+        for user in result.get("users", []):
+            user_id = user.get("id")
+            if user_id:
+                name = user.get("first_name", "")
+                if user.get("last_name"):
+                    name += " " + user.get("last_name")
+                users[user_id] = name or f"User{user_id}"
+
+        for msg in raw_messages:
+            if not isinstance(msg, dict):
+                continue
+
+            msg_id = msg.get("id")
+            if not msg_id:
+                continue
+
+            text = msg.get("message") or msg.get("text") or ""
+            from_id = msg.get("from_id", {})
+
+            if isinstance(from_id, dict):
+                sender_id = from_id.get("user_id")
+            else:
+                sender_id = from_id
+
+            sender_name = users.get(sender_id, f"User{sender_id}" if sender_id else "Unknown")
+
+            messages.append({
+                "id": msg_id,
+                "text": text,
+                "sender_name": sender_name,
+                "sender_id": sender_id,
+                "date": msg.get("date"),
+            })
+
+        return messages
     
     async def _create_group(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
         """Create a group"""
