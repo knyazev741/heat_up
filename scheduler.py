@@ -28,10 +28,10 @@ from database import (
     update_account_stage,
     should_skip_warmup
 )
-from admin_sync import sync_session_statuses, get_last_sync_time, save_last_sync_time
+from admin_sync import sync_session_statuses, get_last_sync_time, save_last_sync_time, sync_helper_accounts
 from conversation_engine import get_conversation_engine
 from group_engine import get_group_engine
-from database import count_active_conversations, count_active_bot_groups
+from database import count_active_conversations, count_active_bot_groups, count_helper_accounts
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,22 @@ class WarmupScheduler:
                     logger.warning(f"⚠️ Initial sync failed: {result.get('error', 'Unknown error')}")
             except Exception as e:
                 logger.error(f"❌ Error during initial sync: {e}")
+
+            # Sync helper accounts for Phase 1 conversations/groups
+            logger.info("🔄 Syncing helper accounts...")
+            try:
+                helper_result = await sync_helper_accounts()
+                if helper_result['success']:
+                    logger.info(
+                        f"✅ Helper sync completed: "
+                        f"{helper_result['added']} added, "
+                        f"{helper_result['updated']} updated, "
+                        f"{helper_result['skipped']} skipped"
+                    )
+                else:
+                    logger.warning(f"⚠️ Helper sync failed: {helper_result.get('error', 'Unknown error')}")
+            except Exception as e:
+                logger.error(f"❌ Error syncing helpers: {e}")
         else:
             logger.info("ℹ️ Admin API sync disabled in settings")
         
@@ -512,11 +528,13 @@ class WarmupScheduler:
         accounts = get_accounts_for_warmup()
         active_conversations = count_active_conversations()
         active_groups = count_active_bot_groups()
+        helper_count = count_helper_accounts()
 
         return {
             "is_running": self.is_running,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "accounts_scheduled": len(accounts),
+            "helper_accounts": helper_count,
             "active_conversations": active_conversations,
             "active_groups": active_groups,
             "private_conversations_enabled": self.enable_private_conversations,

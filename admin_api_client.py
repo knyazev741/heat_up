@@ -273,53 +273,101 @@ class AdminAPIClient:
         Check the status of a session in Admin API.
 
         Args:
-            session_id: Session UID string
+            session_id: Session ID (which is the Admin API's `id` field)
 
         Returns:
             Status integer or None if not found
         """
-        session = await self.get_session_by_session_id(session_id)
-        if session:
-            return session.get("status")
+        # Our session_id IS the Admin API's id, so use get_session_by_id
+        try:
+            session = await self.get_session_by_id(int(session_id))
+            if session:
+                return session.get("status")
+        except (ValueError, TypeError):
+            # session_id is not a valid integer, try search
+            session = await self.get_session_by_session_id(session_id)
+            if session:
+                return session.get("status")
         return None
 
     async def get_banned_forever_sessions(self, limit: int = 100) -> List[Dict[str, Any]]:
         """
         Get all banned forever sessions (spamblock=true and no unban_date)
-        
+
         Args:
             limit: Maximum number of sessions per request (pagination handled internally)
-            
+
         Returns:
             List of banned forever session objects
         """
         all_sessions = []
         skip = 0
-        
+
         while True:
             result = await self.get_sessions(
                 skip=skip,
                 limit=limit,
                 spamblock=True
             )
-            
+
             items = result.get("items", [])
-            
+
             # Filter for only "forever banned" (no unban_date)
             forever_banned = [
                 session for session in items
                 if session.get("spamblock") and not session.get("unban_date")
             ]
-            
+
             all_sessions.extend(forever_banned)
-            
+
             # Check if we've fetched all sessions
             if len(items) < limit:
                 break
-                
+
             skip += limit
-        
+
         logger.info(f"Fetched {len(all_sessions)} banned forever sessions from Admin API")
+        return all_sessions
+
+    async def get_helper_accounts(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get helper accounts (spamblock=true, status=2, not deleted/frozen).
+
+        Helper accounts:
+        - Have permanent spamblock (can't initiate DMs)
+        - CAN respond to DMs
+        - CAN write in groups
+        - Used as "crowd" for conversations between warmup bots
+
+        Args:
+            limit: Maximum number of sessions per request (pagination handled internally)
+
+        Returns:
+            List of helper session objects with session_id, phone, first_name, last_name
+        """
+        all_sessions = []
+        skip = 0
+
+        while True:
+            result = await self.get_sessions(
+                skip=skip,
+                limit=limit,
+                spamblock=True,
+                status=2,  # Active status
+                frozen=False,
+                deleted=False
+            )
+
+            items = result.get("items", [])
+            all_sessions.extend(items)
+
+            # Check if we've fetched all sessions
+            if len(items) < limit:
+                break
+
+            skip += limit
+
+        logger.info(f"Fetched {len(all_sessions)} helper accounts from Admin API")
         return all_sessions
 
 

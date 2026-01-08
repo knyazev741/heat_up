@@ -633,6 +633,9 @@ class GroupEngine:
         """
         Find lonely accounts and create/join groups for them.
 
+        Creator must be a warmup account.
+        Members can be both warmup and helper accounts.
+
         Returns:
             Number of new activities initiated
         """
@@ -644,10 +647,11 @@ class GroupEngine:
             )
             return 0
 
-        # Get accounts that need group membership
+        # Get accounts that need group membership (includes both warmup and helpers)
         lonely_accounts = get_accounts_without_group_membership(
             min_stage=MIN_STAGE_FOR_DM,
-            limit=10
+            limit=15,  # Get more to have options
+            include_helpers=True
         )
 
         if len(lonely_accounts) < self.min_members_per_group:
@@ -657,12 +661,42 @@ class GroupEngine:
             )
             return 0
 
-        # Create a new group with some of these accounts
-        creator = lonely_accounts[0]
-        initial_members = [acc["session_id"] for acc in lonely_accounts[1:self.max_members_per_group]]
+        # Separate warmup and helper accounts
+        warmup_accounts = [a for a in lonely_accounts if a.get("account_type") == "warmup"]
+        helper_accounts = [a for a in lonely_accounts if a.get("account_type") == "helper"]
+
+        # Creator MUST be a warmup account (helpers can't create groups)
+        if not warmup_accounts:
+            logger.debug("No warmup accounts available to create group")
+            return 0
+
+        creator = warmup_accounts[0]
+
+        # Members can be mix of warmup and helpers
+        # Prioritize warmup accounts, add helpers to fill remaining slots
+        potential_members = warmup_accounts[1:] + helper_accounts
+        initial_members = [
+            acc["session_id"]
+            for acc in potential_members[:self.max_members_per_group - 1]
+        ]
+
+        if len(initial_members) < self.min_members_per_group - 1:
+            logger.debug(
+                f"Not enough members for new group "
+                f"({len(initial_members) + 1} < {self.min_members_per_group})"
+            )
+            return 0
 
         # Choose random group type
         group_type = random.choice(["friends", "thematic"])
+
+        # Log member composition
+        warmup_count = sum(1 for a in potential_members[:self.max_members_per_group - 1]
+                          if a.get("account_type") == "warmup")
+        helper_count = len(initial_members) - warmup_count
+        logger.info(
+            f"Creating group: 1 creator + {warmup_count} warmup + {helper_count} helpers"
+        )
 
         result = await self.create_new_group(
             creator_session_id=creator["session_id"],

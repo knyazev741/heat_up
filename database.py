@@ -1773,25 +1773,43 @@ def get_accounts_without_active_conversations(
 
 def get_potential_conversation_partners(
     initiator_session_id: str,
-    limit: int = 10
+    limit: int = 10,
+    include_helpers: bool = True
 ) -> List[Dict[str, Any]]:
     """
-    Get potential partners for a new conversation
+    Get potential partners for a new conversation.
 
-    Excludes accounts that already have an active conversation with the initiator
+    Includes both warmup and helper accounts.
+    Helpers (spamblock) can respond to DMs but can't initiate.
 
     Args:
         initiator_session_id: Session ID of the initiator
         limit: Maximum number of partners to return
+        include_helpers: Whether to include helper accounts
 
     Returns:
-        List of account dicts
+        List of account dicts with account_type field
     """
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
+
+            # Build account type filter
+            if include_helpers:
+                # Include both warmup and helper accounts
+                # Warmup: not banned OR has unban_date
+                # Helper: banned forever but account_type='helper'
+                ban_filter = """
+                AND (
+                    (a.is_banned = 0 OR (a.is_banned = 1 AND a.unban_date IS NOT NULL))
+                    OR a.account_type = 'helper'
+                )
                 """
+            else:
+                ban_filter = "AND (a.is_banned = 0 OR (a.is_banned = 1 AND a.unban_date IS NOT NULL))"
+
+            cursor.execute(
+                f"""
                 SELECT a.*, p.generated_name, p.interests, p.communication_style
                 FROM accounts a
                 LEFT JOIN personas p ON a.id = p.account_id
@@ -1799,7 +1817,7 @@ def get_potential_conversation_partners(
                 AND a.is_active = 1
                 AND a.is_deleted = 0
                 AND a.is_frozen = 0
-                AND (a.is_banned = 0 OR (a.is_banned = 1 AND a.unban_date IS NOT NULL))
+                {ban_filter}
                 AND NOT EXISTS (
                     SELECT 1 FROM private_conversations pc
                     WHERE pc.status = 'active'
@@ -1808,7 +1826,10 @@ def get_potential_conversation_partners(
                         OR (pc.responder_session_id = ? AND pc.initiator_session_id = a.session_id)
                     )
                 )
-                ORDER BY a.warmup_stage DESC, RANDOM()
+                ORDER BY
+                    CASE WHEN a.account_type = 'warmup' THEN 0 ELSE 1 END,
+                    a.warmup_stage DESC,
+                    RANDOM()
                 LIMIT ?
                 """,
                 (initiator_session_id, initiator_session_id, initiator_session_id, limit)
@@ -2182,28 +2203,57 @@ def count_active_bot_groups() -> int:
 
 def get_accounts_without_group_membership(
     min_stage: int = MIN_STAGE_FOR_DM,
-    limit: int = 20
+    limit: int = 20,
+    include_helpers: bool = True
 ) -> List[Dict[str, Any]]:
-    """Get accounts not currently in any active bot group"""
+    """
+    Get accounts not currently in any active bot group.
+
+    Includes both warmup and helper accounts.
+    Helpers can participate in groups (write messages).
+
+    Args:
+        min_stage: Minimum warmup stage (for warmup accounts)
+        limit: Max accounts to return
+        include_helpers: Whether to include helper accounts
+
+    Returns:
+        List of account dicts with account_type field
+    """
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
+
+            # Helpers have warmup_stage=14 by default, so stage filter works for both
+            # But we also need to allow helpers even if they're "banned"
+            if include_helpers:
+                account_filter = """
+                AND (
+                    (a.account_type = 'warmup' AND a.warmup_stage >= ?)
+                    OR a.account_type = 'helper'
+                )
                 """
+            else:
+                account_filter = "AND a.account_type = 'warmup' AND a.warmup_stage >= ?"
+
+            cursor.execute(
+                f"""
                 SELECT a.*, p.generated_name, p.interests, p.communication_style
                 FROM accounts a
                 LEFT JOIN personas p ON a.id = p.account_id
                 WHERE a.is_active = 1
                 AND a.is_deleted = 0
                 AND a.is_frozen = 0
-                AND a.warmup_stage >= ?
+                {account_filter}
                 AND NOT EXISTS (
                     SELECT 1 FROM bot_group_members gm
                     JOIN bot_groups g ON gm.group_id = g.id
                     WHERE gm.account_id = a.id
                     AND g.status = 'active'
                 )
-                ORDER BY RANDOM()
+                ORDER BY
+                    CASE WHEN a.account_type = 'warmup' THEN 0 ELSE 1 END,
+                    RANDOM()
                 LIMIT ?
                 """,
                 (min_stage, limit)
@@ -2222,4 +2272,24 @@ def get_accounts_without_group_membership(
     except Exception as e:
         logger.error(f"Error getting accounts without group membership: {e}")
         return []
+
+
+def count_helper_accounts() -> int:
+    """Count active helper accounts in the database"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM accounts
+                WHERE account_type = 'helper'
+                AND is_active = 1
+                AND is_deleted = 0
+                AND is_frozen = 0
+                """
+            )
+            return cursor.fetchone()[0]
+    except Exception as e:
+        logger.error(f"Error counting helper accounts: {e}")
+        return 0
 
