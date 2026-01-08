@@ -151,6 +151,8 @@ class ActionExecutor:
             return await self._forward_message(session_id, action)
         elif action_type == "update_privacy":
             return await self._update_privacy(session_id, action)
+        elif action_type == "reply_to_dm":
+            return await self._reply_to_dm(session_id, action)
         else:
             return {"error": f"Unknown action type: {action_type}"}
     
@@ -1090,7 +1092,115 @@ class ActionExecutor:
             "settings": privacy_settings,
             "status": "completed"
         }
-    
+
+    async def _reply_to_dm(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Reply to an incoming DM in an existing conversation.
+
+        Args:
+            session_id: Session ID of the sender
+            action: Action dict with conversation_id and message
+
+        Returns:
+            Result dict with success/error status
+        """
+        from database import (
+            get_conversation, get_account, save_conversation_message,
+            update_conversation
+        )
+        from datetime import datetime
+
+        conversation_id = action.get("conversation_id")
+        message = action.get("message")
+
+        if not conversation_id or not message:
+            return {"error": "Missing conversation_id or message"}
+
+        logger.info(f"📩 Replying to DM in conversation {conversation_id}")
+
+        # Get conversation info
+        conversation = get_conversation(conversation_id)
+        if not conversation:
+            logger.warning(f"Conversation {conversation_id} not found")
+            return {"error": f"Conversation {conversation_id} not found"}
+
+        # Determine who we're replying to
+        initiator_session = conversation.get("initiator_session_id")
+        responder_session = conversation.get("responder_session_id")
+
+        # Find the peer (the other party)
+        if str(initiator_session) == str(session_id):
+            peer_session_id = responder_session
+        else:
+            peer_session_id = initiator_session
+
+        if not peer_session_id:
+            return {"error": "Could not determine peer session"}
+
+        # Get our account ID for recording the message
+        sender_account = get_account(session_id)
+        if not sender_account:
+            return {"error": f"Could not find account for session {session_id}"}
+
+        sender_account_id = sender_account["id"]
+
+        # Get peer account to find their phone/username
+        peer_account = get_account(str(peer_session_id))
+        if not peer_account:
+            return {"error": f"Could not find peer account {peer_session_id}"}
+
+        # Prefer username, fallback to phone
+        peer_identifier = peer_account.get("username") or peer_account.get("phone")
+        if not peer_identifier:
+            return {"error": "Peer has no username or phone"}
+
+        logger.info(f"📤 Sending reply to {peer_identifier}: {message[:50]}...")
+
+        # Send the message via Telegram
+        result = await self.telegram_client.send_message(
+            session_id,
+            peer_identifier,
+            message,
+            disable_notification=True
+        )
+
+        if result.get("error"):
+            logger.error(f"Failed to send DM reply: {result.get('error')}")
+            return result
+
+        # Record the message in database
+        telegram_message_id = result.get("result", {}).get("message_id")
+
+        msg_id = save_conversation_message(
+            conversation_id=conversation_id,
+            sender_account_id=sender_account_id,
+            message_text=message,
+            message_type="text",
+            telegram_message_id=telegram_message_id
+        )
+
+        if msg_id:
+            logger.info(f"✅ Message saved to conversation {conversation_id} (msg_id={msg_id})")
+
+            # Update conversation stats
+            current_count = conversation.get("message_count", 0)
+            update_conversation(
+                conversation_id,
+                message_count=current_count + 1,
+                last_message_at=datetime.utcnow()
+            )
+        else:
+            logger.warning("Failed to save message to database")
+
+        return {
+            "action": "reply_to_dm",
+            "conversation_id": conversation_id,
+            "peer": peer_identifier,
+            "message_preview": message[:50],
+            "status": "sent",
+            "telegram_message_id": telegram_message_id
+        }
+
     def _check_floodwait_keywords(self, text: str) -> bool:
         """Check if text contains potential spam keywords"""
         spam_keywords = [

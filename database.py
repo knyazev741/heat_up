@@ -1518,6 +1518,77 @@ def get_conversations_needing_response() -> List[Dict[str, Any]]:
         return []
 
 
+def get_pending_incoming_dms(session_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Get pending incoming DMs for a specific account.
+
+    Returns conversations where:
+    - Account is a participant (initiator or responder)
+    - Last message was NOT sent by this account
+    - Conversation is active
+
+    Args:
+        session_id: Session ID of the account
+        limit: Maximum number of pending DMs to return
+
+    Returns:
+        List of dicts with conversation info and last message
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            # Get account ID
+            cursor.execute(
+                "SELECT id FROM accounts WHERE session_id = ?",
+                (session_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return []
+            account_id = row[0]
+
+            # Get active conversations where this account is a participant
+            cursor.execute(
+                """
+                SELECT
+                    pc.id as conversation_id,
+                    pc.initiator_session_id,
+                    pc.responder_session_id,
+                    pc.initiator_account_id,
+                    pc.responder_account_id,
+                    pc.message_count,
+                    pc.last_message_at,
+                    cm.message_text as last_message_text,
+                    cm.sender_account_id as last_sender_id,
+                    cm.sent_at as last_message_sent_at,
+                    p_sender.generated_name as sender_name,
+                    CASE
+                        WHEN pc.initiator_account_id = ? THEN pc.responder_session_id
+                        ELSE pc.initiator_session_id
+                    END as peer_session_id
+                FROM private_conversations pc
+                LEFT JOIN conversation_messages cm ON cm.conversation_id = pc.id
+                LEFT JOIN personas p_sender ON cm.sender_account_id = p_sender.account_id
+                WHERE pc.status = 'active'
+                AND (pc.initiator_account_id = ? OR pc.responder_account_id = ?)
+                AND cm.id = (
+                    SELECT MAX(id) FROM conversation_messages
+                    WHERE conversation_id = pc.id
+                )
+                AND cm.sender_account_id != ?
+                ORDER BY cm.sent_at DESC
+                LIMIT ?
+                """,
+                (account_id, account_id, account_id, account_id, limit)
+            )
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting pending incoming DMs: {e}")
+        return []
+
+
 def update_conversation(conversation_id: int, **kwargs) -> bool:
     """
     Update conversation fields

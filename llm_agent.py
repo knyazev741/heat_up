@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 from datetime import datetime
 from openai import OpenAI
 from config import settings, CHANNEL_POOL, BOTS_POOL, WARMUP_GUIDELINES, RED_FLAGS, GREEN_FLAGS
-from database import get_session_summary, get_session_history, get_account, get_persona, get_relevant_chats
+from database import get_session_summary, get_session_history, get_account, get_persona, get_relevant_chats, get_pending_incoming_dms
 
 logger = logging.getLogger(__name__)
 
@@ -88,10 +88,31 @@ class ActionPlannerAgent:
             logger.warning(f"⚠️ NO relevant chats! Using fallback: {len(fallback_channels[:10])} channels")
         
         bots_list = "\n".join([
-            f"- {bot['username']}: {bot['description']}" 
+            f"- {bot['username']}: {bot['description']}"
             for bot in BOTS_POOL[:5]
         ]) if BOTS_POOL else "No bots available"
-        
+
+        # Check for pending incoming DMs
+        pending_dms = get_pending_incoming_dms(session_id, limit=3)
+        pending_dms_context = ""
+        if pending_dms:
+            dm_lines = []
+            for dm in pending_dms:
+                sender_name = dm.get('sender_name', 'Неизвестный')
+                last_msg = dm.get('last_message_text', '')[:100]
+                conv_id = dm.get('conversation_id')
+                peer_session = dm.get('peer_session_id')
+                dm_lines.append(f"- От {sender_name} (conversation_id={conv_id}): \"{last_msg}...\"")
+            pending_dms_context = f"""
+📬 НЕПРОЧИТАННЫЕ СООБЩЕНИЯ В ЛС:
+У тебя есть непрочитанные сообщения от других пользователей! Ты можешь ответить на них, если хочешь.
+
+{chr(10).join(dm_lines)}
+
+Чтобы ответить, используй действие reply_to_dm с conversation_id.
+"""
+            logger.info(f"📬 Found {len(pending_dms)} pending incoming DMs for {session_id}")
+
         # Build persona context
         if persona_data:
             persona_context = f"""
@@ -304,6 +325,7 @@ class ActionPlannerAgent:
 
 {flags_guidance}
 {history_context}
+{pending_dms_context}
 
 Твоя задача - сгенерировать реалистичную последовательность действий, которые ты бы совершил в Telegram СЕГОДНЯ.
 
@@ -333,29 +355,35 @@ class ActionPlannerAgent:
 6. "react_to_message" - Поставить реакцию на сообщение
    - Params: channel_username (или chat_username)
    - Доступно со стадии 5+
-   
+
 7. "message_bot" - Написать боту
    - Params: bot_username, message (например "/start", "/help")
    - Доступно со стадии 5+
-   
-8. "reply_in_chat" - Ответить на сообщение в группе
+
+8. "reply_to_dm" - Ответить на личное сообщение
+   - Params: conversation_id, message (текст ответа)
+   - Доступно со стадии 2+
+   - Используй если есть непрочитанные сообщения в ЛС (см. выше)
+   - Пример: {{"action": "reply_to_dm", "conversation_id": 123, "message": "Привет! Да, интересная тема..."}}
+
+9. "reply_in_chat" - Ответить на сообщение в группе
    - Params: chat_username, reply_text
    - Доступно со стадии 8+
    - LLM сгенерирует естественный ответ
-   
-9. "sync_contacts" - Синхронизировать контакты
-   - Доступно со стадии 4+
-   
-10. "update_privacy" - Настроить приватность
-   - Доступно со стадии 3+
-   
-11. "create_group" - Создать группу
-   - Params: group_name
-   - Доступно со стадии 10+
-   
-12. "forward_message" - Переслать сообщение
-   - Params: from_chat, to_chat
-   - Доступно со стадии 12+
+
+10. "sync_contacts" - Синхронизировать контакты
+    - Доступно со стадии 4+
+
+11. "update_privacy" - Настроить приватность
+    - Доступно со стадии 3+
+
+12. "create_group" - Создать группу
+    - Params: group_name
+    - Доступно со стадии 10+
+
+13. "forward_message" - Переслать сообщение
+    - Params: from_chat, to_chat
+    - Доступно со стадии 12+
 
 КРИТИЧЕСКИ ВАЖНО:
 - СТРОГО соблюдай лимиты текущей стадии!
@@ -489,7 +517,7 @@ class ActionPlannerAgent:
             "update_profile", "join_channel", "read_messages", "idle",
             "react_to_message", "message_bot", "view_profile",
             "reply_in_chat", "sync_contacts", "update_privacy",
-            "create_group", "forward_message"
+            "create_group", "forward_message", "reply_to_dm"
         }
         
         for action in actions:
@@ -575,7 +603,13 @@ class ActionPlannerAgent:
                         action["duration_seconds"] = 5
                     action["duration_seconds"] = min(8, max(3, action["duration_seconds"]))
                     validated.append(action)
-        
+
+            elif action_type == "reply_to_dm":
+                if "conversation_id" in action and "message" in action:
+                    # Sanitize message length
+                    action["message"] = action["message"][:500]
+                    validated.append(action)
+
         # Ensure we have at least some actions
         if len(validated) < 3:
             logger.warning("Too few valid actions, using fallback")
