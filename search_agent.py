@@ -109,38 +109,47 @@ class SearchAgent:
         return ranked_chats[:limit]
     
     def _generate_search_queries(self, persona: Dict[str, Any]) -> List[str]:
-        """Генерирует разные форматы поисковых запросов"""
-        
+        """
+        Генерирует поисковые запросы с приоритетом на ГРУППЫ (не каналы).
+
+        Phase 2: Приоритет на группы где можно писать, а не каналы только для чтения.
+        """
+
         city = persona.get('city', 'Москва')
         interests = persona.get('interests', [])
         occupation = persona.get('occupation', '')
-        
+
         queries = []
-        
-        # ГРУППЫ ГОРОДА (высший приоритет)
+
+        # ВЫСШИЙ ПРИОРИТЕТ: Публичные группы города (можно писать!)
         queries.extend([
-            f"{city} telegram group chat",
-            f"t.me {city} жители",
-            f"telegram чат {city} общение",
-            f"{city} telegram группа",
+            f"{city} telegram группа чат общение",
+            f"telegram чат жителей {city}",
+            f"публичная группа telegram {city}",
+            f"t.me чат {city} общение",
+            f"{city} telegram group chat community",
         ])
-        
-        # ТЕМАТИЧЕСКИЕ ГРУППЫ по интересам
-        for interest in interests[:3]:  # Топ-3 интереса
+
+        # ТЕМАТИЧЕСКИЕ ГРУППЫ по интересам (приоритет на группы!)
+        for interest in interests[:4]:  # Топ-4 интереса
             queries.extend([
-                f"{city} {interest} telegram",
-                f"t.me {interest} {city}",
-                f"telegram группа {interest}",
+                f"telegram группа {interest} {city}",
+                f"telegram чат {interest} обсуждение",
+                f"t.me {interest} группа чат",
+                f"публичный чат {interest} telegram",
             ])
-        
+
         # ПРОФЕССИОНАЛЬНЫЕ группы
         if occupation:
-            queries.append(f"telegram {occupation} {city}")
-        
-        # НОВОСТИ ГОРОДА
+            queries.extend([
+                f"telegram группа {occupation}",
+                f"telegram чат {occupation} сообщество",
+            ])
+
+        # РЕГИОНАЛЬНЫЕ группы (низший приоритет для каналов)
         queries.append(f"telegram канал {city} новости")
-        
-        return queries[:15]  # Макс 15 запросов
+
+        return queries[:20]  # Макс 20 запросов для Phase 2
     
     async def _search_google(self, queries: List[str]) -> List[Dict[str, Any]]:
         """

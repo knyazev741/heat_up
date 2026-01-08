@@ -31,6 +31,7 @@ from database import (
 from admin_sync import sync_session_statuses, get_last_sync_time, save_last_sync_time, sync_helper_accounts
 from conversation_engine import get_conversation_engine
 from group_engine import get_group_engine
+from real_chat_engine import RealChatEngine
 from database import count_active_conversations, count_active_bot_groups, count_helper_accounts
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class WarmupScheduler:
         self.executor = ActionExecutor(self.telegram_client)
         self.conversation_engine = get_conversation_engine(self.telegram_client)
         self.group_engine = get_group_engine(self.telegram_client)
+        self.real_chat_engine = RealChatEngine(self.telegram_client)
 
         self.is_running = False
         self.started_at = None
@@ -60,6 +62,8 @@ class WarmupScheduler:
         # Phase 1 settings
         self.enable_private_conversations = True  # Enable Phase 1.2 DM feature
         self.enable_group_chats = True  # Enable Phase 1.3 Group chats feature
+        # Phase 2 settings
+        self.enable_real_chat_participation = True  # Enable Phase 2 real chat participation
     
     async def start(self):
         """Запустить scheduler"""
@@ -206,6 +210,13 @@ class WarmupScheduler:
                         await self._process_groups()
                     except Exception as e:
                         logger.error(f"Error processing groups: {e}")
+
+                # ========== PHASE 2: Real Public Chat Participation ==========
+                if self.enable_real_chat_participation:
+                    try:
+                        await self._process_real_chat_participation()
+                    except Exception as e:
+                        logger.error(f"Error processing real chat participation: {e}")
 
                 logger.info(f"✅ Check cycle completed. Next check in {settings.scheduler_check_interval}s")
                 logger.info("=" * 80)
@@ -522,6 +533,35 @@ class WarmupScheduler:
 
         logger.info(f"👥 Groups processed (now {count_active_bot_groups()} active)")
 
+    async def _process_real_chat_participation(self):
+        """
+        Process participation in real public group chats (Phase 2).
+
+        - Analyze context of joined groups
+        - Send contextual messages where appropriate
+        - Track participation statistics
+        """
+        logger.info("🌐 Processing real chat participation...")
+
+        try:
+            result = await self.real_chat_engine.process_real_chat_activity()
+
+            if result.get("messages_sent", 0) > 0:
+                logger.info(
+                    f"   Real chats: {result['accounts_processed']} accounts, "
+                    f"{result['chats_analyzed']} chats analyzed, "
+                    f"{result['messages_sent']} messages sent"
+                )
+
+            if result.get("errors"):
+                for err in result["errors"][:3]:  # Log first 3 errors
+                    logger.warning(f"   Error: {err}")
+
+        except Exception as e:
+            logger.error(f"Error in real chat participation: {e}")
+
+        logger.info("🌐 Real chat participation processed")
+
     def get_status(self) -> Dict[str, Any]:
         """Получить статус scheduler"""
 
@@ -539,6 +579,7 @@ class WarmupScheduler:
             "active_groups": active_groups,
             "private_conversations_enabled": self.enable_private_conversations,
             "group_chats_enabled": self.enable_group_chats,
+            "real_chat_participation_enabled": self.enable_real_chat_participation,
             "next_check_in": settings.scheduler_check_interval if self.is_running else None
         }
 
