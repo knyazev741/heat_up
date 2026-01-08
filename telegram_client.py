@@ -11,6 +11,8 @@ from telegram_tl_helpers import (
     make_input_peer_chat,
     make_get_peer_dialogs_query,
     make_read_history_query,
+    make_import_contacts_query,
+    make_send_message_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -782,6 +784,140 @@ class TelegramAPIClient:
         
         query = make_click_sponsored_message_query(random_id, media, fullscreen)
         logger.debug(f"Marking sponsored message as clicked (media={media}, fullscreen={fullscreen})")
-        
+
         return await self.invoke_raw(session_id, query)
+
+    async def import_contact(
+        self,
+        session_id: str,
+        phone: str,
+        first_name: str,
+        last_name: str = ""
+    ) -> Dict[str, Any]:
+        """
+        Import a contact by phone number to get access_hash for DM.
+
+        This is required before sending DMs to users who are not in contacts.
+        The returned user object will contain the access_hash needed for messaging.
+
+        Args:
+            session_id: Telegram session UID
+            phone: Phone number with country code (e.g., "+79123456789")
+            first_name: First name for the contact
+            last_name: Last name for the contact (optional)
+
+        Returns:
+            API response with imported contact info including user_id and access_hash
+        """
+        query = make_import_contacts_query(phone, first_name, last_name)
+
+        logger.info(f"Importing contact {phone} for session {session_id}")
+
+        result = await self.invoke_raw(session_id, query)
+
+        if result.get("error"):
+            logger.error(f"Failed to import contact {phone}: {result.get('error')}")
+            return result
+
+        # Extract user info from response
+        response_result = result.get("result", {})
+        users = response_result.get("users", [])
+        imported = response_result.get("imported", [])
+
+        if users:
+            user = users[0]
+            logger.info(
+                f"Imported contact: user_id={user.get('id')}, "
+                f"access_hash={user.get('access_hash')}"
+            )
+            return {
+                "success": True,
+                "user_id": user.get("id"),
+                "access_hash": user.get("access_hash"),
+                "user": user,
+                "imported": len(imported) > 0,
+                "result": response_result
+            }
+
+        logger.warning(f"No users returned for contact {phone}")
+        return {"success": False, "error": "No users found", "result": response_result}
+
+    async def send_dm_to_user(
+        self,
+        session_id: str,
+        user_id: int,
+        access_hash: int,
+        message: str,
+        silent: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Send a direct message to a user using raw TL method.
+
+        Requires user_id and access_hash which can be obtained via import_contact().
+
+        Args:
+            session_id: Telegram session UID
+            user_id: Target user's Telegram ID
+            access_hash: Target user's access hash
+            message: Message text
+            silent: Send silently (no notification)
+
+        Returns:
+            API response with sent message info
+        """
+        # Create InputPeerUser with access_hash
+        input_peer = make_input_peer_user(user_id, access_hash)
+
+        # Create SendMessage query
+        query = make_send_message_query(
+            peer=input_peer,
+            message=message,
+            silent=silent
+        )
+
+        logger.info(f"Sending DM to user {user_id} from session {session_id}")
+
+        result = await self.invoke_raw(session_id, query)
+
+        if result.get("error"):
+            logger.error(f"Failed to send DM: {result.get('error')}")
+            return result
+
+        logger.info(f"DM sent successfully to user {user_id}")
+        return {"success": True, "result": result.get("result")}
+
+    async def get_own_phone_number(self, session_id: str) -> Optional[str]:
+        """
+        Get the actual phone number of a session from Telegram API.
+
+        This is useful because local database may have stale phone numbers.
+
+        Args:
+            session_id: Telegram session UID
+
+        Returns:
+            Phone number string (without +) or None if not found
+        """
+        from telegram_tl_helpers import make_get_full_user_query
+
+        query = make_get_full_user_query()
+        result = await self.invoke_raw(session_id, query)
+
+        if result.get("error"):
+            logger.error(f"Failed to get own user info for {session_id}: {result.get('error')}")
+            return None
+
+        response_result = result.get("result", {})
+        users = response_result.get("users", [])
+
+        if users:
+            phone = users[0].get("phone")
+            if phone:
+                # Ensure it has + prefix
+                if not phone.startswith("+"):
+                    phone = "+" + phone
+                return phone
+
+        logger.warning(f"Could not get phone for session {session_id}")
+        return None
 

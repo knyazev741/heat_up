@@ -29,6 +29,8 @@ from database import (
     should_skip_warmup
 )
 from admin_sync import sync_session_statuses, get_last_sync_time, save_last_sync_time
+from conversation_engine import get_conversation_engine
+from database import count_active_conversations
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +49,14 @@ class WarmupScheduler:
         self.search_agent = SearchAgent()
         self.action_planner = ActionPlannerAgent()
         self.executor = ActionExecutor(self.telegram_client)
-        
+        self.conversation_engine = get_conversation_engine(self.telegram_client)
+
         self.is_running = False
         self.started_at = None
         self._task = None
+
+        # Conversation settings
+        self.enable_private_conversations = True  # Enable Phase 1 DM feature
     
     async def start(self):
         """Запустить scheduler"""
@@ -168,9 +174,16 @@ class WarmupScheduler:
                         logger.error(f"Error processing account {account.get('session_id', 'unknown')}: {e}")
                         continue
                 
+                # ========== PHASE 1: Private Conversations ==========
+                if self.enable_private_conversations:
+                    try:
+                        await self._process_conversations()
+                    except Exception as e:
+                        logger.error(f"Error processing conversations: {e}")
+
                 logger.info(f"✅ Check cycle completed. Next check in {settings.scheduler_check_interval}s")
                 logger.info("=" * 80)
-                
+
                 # Wait until next check
                 await asyncio.sleep(settings.scheduler_check_interval)
             
@@ -437,15 +450,41 @@ class WarmupScheduler:
             logger.error(f"❌ Error during warmup: {e}", exc_info=True)
             logger.error("=" * 100)
     
+    async def _process_conversations(self):
+        """
+        Process private conversations between bot accounts (Phase 1).
+
+        - Process pending responses in active conversations
+        - Start new conversations for accounts without enough active dialogs
+        """
+        active_count = count_active_conversations()
+        logger.info(f"💬 Processing conversations... ({active_count} active)")
+
+        # 1. Process pending responses
+        responses_sent = await self.conversation_engine.process_pending_responses()
+        if responses_sent > 0:
+            logger.info(f"   Sent {responses_sent} conversation responses")
+
+        # 2. Start new conversations (with some probability to not spam)
+        if random.random() < 0.3:  # 30% chance per cycle
+            new_convs = await self.conversation_engine.initiate_new_social_activities()
+            if new_convs > 0:
+                logger.info(f"   Started {new_convs} new conversations")
+
+        logger.info(f"💬 Conversations processed (now {count_active_conversations()} active)")
+
     def get_status(self) -> Dict[str, Any]:
         """Получить статус scheduler"""
-        
+
         accounts = get_accounts_for_warmup()
-        
+        active_conversations = count_active_conversations()
+
         return {
             "is_running": self.is_running,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "accounts_scheduled": len(accounts),
+            "active_conversations": active_conversations,
+            "private_conversations_enabled": self.enable_private_conversations,
             "next_check_in": settings.scheduler_check_interval if self.is_running else None
         }
 

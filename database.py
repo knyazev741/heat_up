@@ -239,12 +239,113 @@ def init_database():
         """)
         
         cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_warmup_sessions_account 
+            CREATE INDEX IF NOT EXISTS idx_warmup_sessions_account
             ON warmup_sessions(account_id)
         """)
-        
+
+        # ========== PHASE 1: PRIVATE CONVERSATIONS ==========
+
+        # Migration: Add account_type and can_initiate_dm columns to accounts
+        try:
+            cursor.execute("SELECT account_type FROM accounts LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("Adding account_type column to accounts table")
+            cursor.execute("ALTER TABLE accounts ADD COLUMN account_type TEXT DEFAULT 'warmup'")
+
+        try:
+            cursor.execute("SELECT can_initiate_dm FROM accounts LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("Adding can_initiate_dm column to accounts table")
+            cursor.execute("ALTER TABLE accounts ADD COLUMN can_initiate_dm BOOLEAN DEFAULT 1")
+
+        # Create private_conversations table for DM dialogs between bots
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS private_conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                -- Participants
+                initiator_account_id INTEGER NOT NULL,
+                responder_account_id INTEGER NOT NULL,
+
+                -- Telegram session IDs for communication
+                initiator_session_id TEXT NOT NULL,
+                responder_session_id TEXT NOT NULL,
+
+                -- Context for starting the dialog
+                conversation_starter TEXT,
+                common_context TEXT,
+
+                -- Topic and state
+                current_topic TEXT,
+                topics_discussed TEXT,
+
+                -- Timings
+                started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_message_at DATETIME,
+                next_response_after DATETIME,
+
+                -- Counters
+                message_count INTEGER DEFAULT 0,
+                initiator_messages INTEGER DEFAULT 0,
+                responder_messages INTEGER DEFAULT 0,
+
+                -- State: active, paused, cooling_down, ended
+                status TEXT DEFAULT 'active',
+                end_reason TEXT,
+
+                -- Quality score (0-1)
+                quality_score REAL,
+
+                FOREIGN KEY (initiator_account_id) REFERENCES accounts(id),
+                FOREIGN KEY (responder_account_id) REFERENCES accounts(id)
+            )
+        """)
+
+        # Create conversation_messages table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                sender_account_id INTEGER NOT NULL,
+
+                message_text TEXT NOT NULL,
+                message_type TEXT DEFAULT 'text',
+
+                sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                telegram_message_id INTEGER,
+
+                -- For tracking if message was delivered/read
+                is_delivered BOOLEAN DEFAULT 0,
+                is_read BOOLEAN DEFAULT 0,
+
+                FOREIGN KEY (conversation_id) REFERENCES private_conversations(id),
+                FOREIGN KEY (sender_account_id) REFERENCES accounts(id)
+            )
+        """)
+
+        # Indexes for conversations
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversations_initiator
+            ON private_conversations(initiator_account_id)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversations_responder
+            ON private_conversations(responder_account_id)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversations_status
+            ON private_conversations(status, next_response_after)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conv_messages
+            ON conversation_messages(conversation_id, sent_at)
+        """)
+
         conn.commit()
-        
+
     logger.info("Database initialized successfully")
 
 
@@ -1178,4 +1279,472 @@ async def wait_for_warmup_delay(account: Dict[str, Any]) -> None:
         f"✅ Delay completed for session {account.get('session_id', 'unknown')[:8]}... "
         f"starting warmup actions now"
     )
+
+
+# ========== PRIVATE CONVERSATIONS CRUD ==========
+
+MIN_STAGE_FOR_DM = 2  # Minimum warmup stage for DM actions
+
+
+def create_conversation(
+    initiator_account_id: int,
+    responder_account_id: int,
+    initiator_session_id: str,
+    responder_session_id: str,
+    conversation_starter: str = None,
+    common_context: str = None
+) -> Optional[int]:
+    """
+    Create a new private conversation between two accounts
+
+    Args:
+        initiator_account_id: Account ID of the initiator
+        responder_account_id: Account ID of the responder
+        initiator_session_id: Session ID of the initiator
+        responder_session_id: Session ID of the responder
+        conversation_starter: First message text
+        common_context: Context for the conversation
+
+    Returns:
+        Conversation ID or None
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO private_conversations (
+                    initiator_account_id, responder_account_id,
+                    initiator_session_id, responder_session_id,
+                    conversation_starter, common_context,
+                    started_at, last_message_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    initiator_account_id,
+                    responder_account_id,
+                    initiator_session_id,
+                    responder_session_id,
+                    conversation_starter,
+                    common_context,
+                    datetime.utcnow(),
+                    datetime.utcnow()
+                )
+            )
+            conn.commit()
+            conversation_id = cursor.lastrowid
+            logger.info(f"Created conversation {conversation_id} between {initiator_session_id[:8]} and {responder_session_id[:8]}")
+            return conversation_id
+    except Exception as e:
+        logger.error(f"Error creating conversation: {e}")
+        return None
+
+
+def get_conversation(conversation_id: int) -> Optional[Dict[str, Any]]:
+    """Get conversation by ID"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM private_conversations WHERE id = ?",
+                (conversation_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+    except Exception as e:
+        logger.error(f"Error getting conversation: {e}")
+        return None
+
+
+def get_active_conversation(session_id_1: str, session_id_2: str) -> Optional[Dict[str, Any]]:
+    """
+    Get active conversation between two sessions
+
+    Args:
+        session_id_1: First session ID
+        session_id_2: Second session ID
+
+    Returns:
+        Conversation dict or None
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM private_conversations
+                WHERE status = 'active'
+                AND (
+                    (initiator_session_id = ? AND responder_session_id = ?)
+                    OR
+                    (initiator_session_id = ? AND responder_session_id = ?)
+                )
+                LIMIT 1
+                """,
+                (session_id_1, session_id_2, session_id_2, session_id_1)
+            )
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+    except Exception as e:
+        logger.error(f"Error getting active conversation: {e}")
+        return None
+
+
+def get_conversations_needing_response() -> List[Dict[str, Any]]:
+    """
+    Get conversations where it's time to send a response
+
+    Returns:
+        List of conversations that need a response
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # Use isoformat() to match the storage format (with T separator)
+            cursor.execute(
+                """
+                SELECT * FROM private_conversations
+                WHERE status = 'active'
+                AND next_response_after IS NOT NULL
+                AND next_response_after <= ?
+                ORDER BY next_response_after ASC
+                LIMIT 20
+                """,
+                (datetime.utcnow().isoformat(),)
+            )
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting conversations needing response: {e}")
+        return []
+
+
+def update_conversation(conversation_id: int, **kwargs) -> bool:
+    """
+    Update conversation fields
+
+    Args:
+        conversation_id: Conversation ID
+        **kwargs: Fields to update
+
+    Returns:
+        True if successful
+    """
+    if not kwargs:
+        return True
+
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            fields = []
+            values = []
+            for key, value in kwargs.items():
+                fields.append(f"{key} = ?")
+                if isinstance(value, datetime):
+                    values.append(value.isoformat())
+                else:
+                    values.append(value)
+
+            values.append(conversation_id)
+
+            query = f"UPDATE private_conversations SET {', '.join(fields)} WHERE id = ?"
+            cursor.execute(query, values)
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error updating conversation: {e}")
+        return False
+
+
+def save_conversation_message(
+    conversation_id: int,
+    sender_account_id: int,
+    message_text: str,
+    message_type: str = "text",
+    telegram_message_id: int = None
+) -> Optional[int]:
+    """
+    Save a message in a conversation
+
+    Args:
+        conversation_id: Conversation ID
+        sender_account_id: Account ID of the sender
+        message_text: Message content
+        message_type: Type of message (text, sticker, voice)
+        telegram_message_id: Telegram message ID
+
+    Returns:
+        Message ID or None
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO conversation_messages (
+                    conversation_id, sender_account_id, message_text,
+                    message_type, telegram_message_id, sent_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    sender_account_id,
+                    message_text,
+                    message_type,
+                    telegram_message_id,
+                    datetime.utcnow()
+                )
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Error saving conversation message: {e}")
+        return None
+
+
+def get_conversation_messages(
+    conversation_id: int,
+    limit: int = 50
+) -> List[Dict[str, Any]]:
+    """
+    Get messages from a conversation
+
+    Args:
+        conversation_id: Conversation ID
+        limit: Maximum number of messages
+
+    Returns:
+        List of message dicts (oldest first)
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT cm.*, a.session_id as sender_session_id, p.generated_name as sender_name
+                FROM conversation_messages cm
+                JOIN accounts a ON cm.sender_account_id = a.id
+                LEFT JOIN personas p ON cm.sender_account_id = p.account_id
+                WHERE cm.conversation_id = ?
+                ORDER BY cm.sent_at ASC
+                LIMIT ?
+                """,
+                (conversation_id, limit)
+            )
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting conversation messages: {e}")
+        return []
+
+
+def get_last_conversation_message(conversation_id: int) -> Optional[Dict[str, Any]]:
+    """Get the last message in a conversation"""
+    messages = get_conversation_messages(conversation_id, limit=1)
+    # Since we order ASC, we need to get from end
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT cm.*, a.session_id as sender_session_id, p.generated_name as sender_name
+                FROM conversation_messages cm
+                JOIN accounts a ON cm.sender_account_id = a.id
+                LEFT JOIN personas p ON cm.sender_account_id = p.account_id
+                WHERE cm.conversation_id = ?
+                ORDER BY cm.sent_at DESC
+                LIMIT 1
+                """,
+                (conversation_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+    except Exception as e:
+        logger.error(f"Error getting last conversation message: {e}")
+        return None
+
+
+def get_accounts_eligible_for_dm() -> List[Dict[str, Any]]:
+    """
+    Get accounts that can participate in DM conversations
+
+    Returns:
+        List of accounts with warmup_stage >= MIN_STAGE_FOR_DM
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT a.*, p.generated_name, p.interests, p.communication_style
+                FROM accounts a
+                LEFT JOIN personas p ON a.id = p.account_id
+                WHERE a.is_active = 1
+                AND a.is_deleted = 0
+                AND a.is_frozen = 0
+                AND a.warmup_stage >= ?
+                AND (a.is_banned = 0 OR (a.is_banned = 1 AND a.unban_date IS NOT NULL))
+                ORDER BY a.warmup_stage DESC, a.last_warmup_date DESC
+                """,
+                (MIN_STAGE_FOR_DM,)
+            )
+            rows = cursor.fetchall()
+            accounts = []
+            for row in rows:
+                acc = dict(row)
+                if acc.get("interests"):
+                    try:
+                        acc["interests"] = json.loads(acc["interests"])
+                    except:
+                        pass
+                accounts.append(acc)
+            return accounts
+    except Exception as e:
+        logger.error(f"Error getting accounts eligible for DM: {e}")
+        return []
+
+
+def get_accounts_without_active_conversations(
+    min_stage: int = MIN_STAGE_FOR_DM,
+    max_active_conversations: int = 2
+) -> List[Dict[str, Any]]:
+    """
+    Get accounts that don't have enough active conversations
+
+    Args:
+        min_stage: Minimum warmup stage required
+        max_active_conversations: Max number of active conversations
+
+    Returns:
+        List of account dicts
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT a.*, p.generated_name, p.interests, p.communication_style,
+                    COALESCE(conv_count.active_convs, 0) as active_conversations
+                FROM accounts a
+                LEFT JOIN personas p ON a.id = p.account_id
+                LEFT JOIN (
+                    SELECT
+                        CASE
+                            WHEN initiator_account_id = accounts.id THEN initiator_account_id
+                            ELSE responder_account_id
+                        END as account_id,
+                        COUNT(*) as active_convs
+                    FROM private_conversations, accounts
+                    WHERE status = 'active'
+                    AND (initiator_account_id = accounts.id OR responder_account_id = accounts.id)
+                    GROUP BY account_id
+                ) conv_count ON a.id = conv_count.account_id
+                WHERE a.is_active = 1
+                AND a.is_deleted = 0
+                AND a.is_frozen = 0
+                AND a.warmup_stage >= ?
+                AND a.can_initiate_dm = 1
+                AND a.account_type = 'warmup'
+                AND (a.is_banned = 0 OR (a.is_banned = 1 AND a.unban_date IS NOT NULL))
+                AND COALESCE(conv_count.active_convs, 0) < ?
+                ORDER BY COALESCE(conv_count.active_convs, 0) ASC, a.warmup_stage DESC
+                LIMIT 10
+                """,
+                (min_stage, max_active_conversations)
+            )
+            rows = cursor.fetchall()
+            accounts = []
+            for row in rows:
+                acc = dict(row)
+                if acc.get("interests"):
+                    try:
+                        acc["interests"] = json.loads(acc["interests"])
+                    except:
+                        pass
+                accounts.append(acc)
+            return accounts
+    except Exception as e:
+        logger.error(f"Error getting accounts without conversations: {e}")
+        return []
+
+
+def get_potential_conversation_partners(
+    initiator_session_id: str,
+    limit: int = 10
+) -> List[Dict[str, Any]]:
+    """
+    Get potential partners for a new conversation
+
+    Excludes accounts that already have an active conversation with the initiator
+
+    Args:
+        initiator_session_id: Session ID of the initiator
+        limit: Maximum number of partners to return
+
+    Returns:
+        List of account dicts
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT a.*, p.generated_name, p.interests, p.communication_style
+                FROM accounts a
+                LEFT JOIN personas p ON a.id = p.account_id
+                WHERE a.session_id != ?
+                AND a.is_active = 1
+                AND a.is_deleted = 0
+                AND a.is_frozen = 0
+                AND (a.is_banned = 0 OR (a.is_banned = 1 AND a.unban_date IS NOT NULL))
+                AND NOT EXISTS (
+                    SELECT 1 FROM private_conversations pc
+                    WHERE pc.status = 'active'
+                    AND (
+                        (pc.initiator_session_id = ? AND pc.responder_session_id = a.session_id)
+                        OR (pc.responder_session_id = ? AND pc.initiator_session_id = a.session_id)
+                    )
+                )
+                ORDER BY a.warmup_stage DESC, RANDOM()
+                LIMIT ?
+                """,
+                (initiator_session_id, initiator_session_id, initiator_session_id, limit)
+            )
+            rows = cursor.fetchall()
+            accounts = []
+            for row in rows:
+                acc = dict(row)
+                if acc.get("interests"):
+                    try:
+                        acc["interests"] = json.loads(acc["interests"])
+                    except:
+                        pass
+                accounts.append(acc)
+            return accounts
+    except Exception as e:
+        logger.error(f"Error getting potential conversation partners: {e}")
+        return []
+
+
+def count_active_conversations() -> int:
+    """Count total active conversations"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) FROM private_conversations WHERE status = 'active'"
+            )
+            return cursor.fetchone()[0]
+    except Exception as e:
+        logger.error(f"Error counting active conversations: {e}")
+        return 0
 

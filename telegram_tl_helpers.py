@@ -332,12 +332,12 @@ def make_click_sponsored_message_query(
 ) -> str:
     """
     Create ClickSponsoredMessage query to mark ad as clicked
-    
+
     Args:
         random_id: Random ID from SponsoredMessage
         media: True if clicking on media (photo/video)
         fullscreen: True if video with sound in fullscreen player
-        
+
     Returns:
         String representation of TL query
     """
@@ -346,6 +346,74 @@ def make_click_sponsored_message_query(
         media=media,
         fullscreen=fullscreen
     )
-    
+
+    return raw_method_to_string(raw_method)
+
+
+def make_import_contacts_query(
+    phone: str,
+    first_name: str,
+    last_name: str = ""
+) -> str:
+    """
+    Create ImportContacts query to add a user to contacts by phone number.
+
+    This is needed before sending DMs to users who are not in your contact list,
+    as Telegram requires an access_hash to message users.
+
+    Args:
+        phone: Phone number with country code (e.g., "+79123456789")
+        first_name: First name for the contact
+        last_name: Last name for the contact (optional)
+
+    Returns:
+        String representation of TL query
+    """
+    import pylogram.raw.functions.contacts
+
+    contact = pylogram.raw.types.InputPhoneContact(
+        client_id=0,  # Unique identifier, we use 0 since we're adding one contact
+        phone=phone,
+        first_name=first_name,
+        last_name=last_name
+    )
+
+    raw_method = pylogram.raw.functions.contacts.ImportContacts(
+        contacts=[contact]
+    )
+
+    return raw_method_to_string(raw_method)
+
+
+def make_send_message_query(
+    peer: pylogram.raw.base.input_peer.InputPeer,
+    message: str,
+    random_id: int = None,
+    silent: bool = True
+) -> str:
+    """
+    Create SendMessage query to send a message to a peer.
+
+    Args:
+        peer: Input peer (channel/chat/user with access_hash)
+        message: Message text
+        random_id: Random ID for message deduplication (auto-generated if None)
+        silent: Send message silently (no notification)
+
+    Returns:
+        String representation of TL query
+    """
+    import random as rand
+
+    if random_id is None:
+        random_id = rand.randint(1, 2**63 - 1)
+
+    raw_method = pylogram.raw.functions.messages.SendMessage(
+        peer=peer,
+        message=message,
+        random_id=random_id,
+        silent=silent
+    )
+
     return raw_method_to_string(raw_method)
 

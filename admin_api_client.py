@@ -237,6 +237,52 @@ class AdminAPIClient:
         logger.info(f"Fetched {len(all_sessions)} deleted sessions from Admin API")
         return all_sessions
     
+    async def get_session_by_session_id(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get session by session_id string (telegram session UID)
+
+        Args:
+            session_id: Session UID string
+
+        Returns:
+            Session data or None if not found
+        """
+        # Use search to find by session_id
+        try:
+            result = await self.get_sessions(
+                search=session_id,
+                limit=1
+            )
+
+            items = result.get("items", [])
+            if items:
+                # Verify it's the exact match
+                for item in items:
+                    if str(item.get("session_id")) == str(session_id):
+                        return item
+                # Return first result if no exact match
+                return items[0] if items else None
+
+            return None
+        except Exception as e:
+            logger.error(f"Error getting session by session_id {session_id}: {e}")
+            return None
+
+    async def check_session_status(self, session_id: str) -> Optional[int]:
+        """
+        Check the status of a session in Admin API.
+
+        Args:
+            session_id: Session UID string
+
+        Returns:
+            Status integer or None if not found
+        """
+        session = await self.get_session_by_session_id(session_id)
+        if session:
+            return session.get("status")
+        return None
+
     async def get_banned_forever_sessions(self, limit: int = 100) -> List[Dict[str, Any]]:
         """
         Get all banned forever sessions (spamblock=true and no unban_date)
