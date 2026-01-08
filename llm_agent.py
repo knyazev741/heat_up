@@ -252,9 +252,28 @@ class ActionPlannerAgent:
         # ДИНАМИЧЕСКИЙ СПИСОК ДЕЙСТВИЙ - в зависимости от истории
         actions_list = []
         action_num = 1
-        
-        # update_profile - ПОЛНОСТЬЮ УДАЛЕНО (замороженные аккаунты)
-        logger.info(f"🚫 update_profile ОТКЛЮЧЕН глобально (вызывает заморозку аккаунтов)")
+
+        # update_profile - доступно с вероятностью 20% и только если профиль еще не обновлялся
+        # и аккаунт не совсем новый (минимум стадия 3)
+        import random
+        profile_update_probability = 0.20  # 20% шанс
+        should_allow_profile_update = (
+            not has_updated_profile and
+            not is_brand_new and
+            warmup_stage >= 3 and
+            random.random() < profile_update_probability
+        )
+
+        if should_allow_profile_update:
+            logger.info(f"✅ update_profile ВКЛЮЧЕН для {session_id} (вероятность {profile_update_probability*100:.0f}%, stage={warmup_stage})")
+            actions_list.append(f"""
+{action_num}. update_profile (ОПЦИОНАЛЬНО - только bio):
+   {{"action": "update_profile", "bio": "Краткое описание о себе на русском", "reason": "Персонализация"}}
+   ВАЖНО: Обновляй ТОЛЬКО bio! НЕ меняй имя/фамилию! Bio должно быть коротким (до 70 символов).""")
+            action_num += 1
+        else:
+            reason = "уже обновлен" if has_updated_profile else "новый аккаунт" if is_brand_new else f"stage {warmup_stage}<3" if warmup_stage < 3 else "не выпало по вероятности"
+            logger.info(f"🚫 update_profile ОТКЛЮЧЕН для {session_id} ({reason})")
         
         # Остальные действия - всегда доступны
         actions_list.append(f"""
@@ -484,28 +503,27 @@ class ActionPlannerAgent:
             
             # Validate required fields
             if action_type == "update_profile":
-                # Проверяем на типичные шаблонные сочетания
+                # Разрешаем ТОЛЬКО обновление bio, без изменения имени/фамилии
                 first_name = action.get('first_name', '')
                 last_name = action.get('last_name', '')
-                
-                # Список ЗАПРЕЩЕННЫХ шаблонных сочетаний
-                forbidden_combinations = [
-                    ('Алексей', 'Иванов'), ('Иван', 'Петров'), ('Екатерина', 'Смирнова'),
-                    ('Александр', 'Кузнецов'), ('Дмитрий', 'Попов'), ('Михаил', 'Соколов'),
-                    ('Андрей', 'Новиков'), ('Сергей', 'Морозов'), ('Николай', 'Волков'),
-                    ('Мария', 'Петрова'), ('Анна', 'Иванова'), ('Елена', 'Смирнова'),
-                    ('Ольга', 'Кузнецова'), ('Наталья', 'Попова'), ('Татьяна', 'Соколова')
-                ]
-                
-                # Проверка
-                is_forbidden = (first_name, last_name) in forbidden_combinations
-                
-                if is_forbidden and first_name and last_name:
-                    logger.warning(f"🚫 BLOCKED template combination: {first_name} {last_name}")
-                    # Убираем фамилию, оставляем только имя
-                    action['last_name'] = ''
-                    logger.info(f"✅ Fixed to: {first_name} (без фамилии)")
-                
+                bio = action.get('bio', '')
+
+                # Если пытаются изменить имя/фамилию - блокируем полностью
+                if first_name or last_name:
+                    logger.warning(f"🚫 BLOCKED update_profile with name change: {first_name} {last_name}")
+                    logger.info(f"   Только bio разрешен для обновления профиля")
+                    continue  # Пропускаем это действие
+
+                # Проверяем что bio есть и не пустое
+                if not bio or len(bio.strip()) < 3:
+                    logger.warning(f"🚫 BLOCKED update_profile without bio or bio too short")
+                    continue
+
+                # Bio слишком длинное - обрезаем до 70 символов
+                if len(bio) > 70:
+                    action['bio'] = bio[:70]
+                    logger.info(f"✂️ Bio обрезан до 70 символов")
+
                 validated.append(action)
                     
             elif action_type in {"join_channel", "join_chat"}:

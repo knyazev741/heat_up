@@ -417,3 +417,102 @@ def make_send_message_query(
 
     return raw_method_to_string(raw_method)
 
+
+def make_create_chat_query(
+    title: str,
+    users: list = None,
+    ttl_period: int = None
+) -> str:
+    """
+    Create CreateChat query to create a basic group chat.
+
+    Args:
+        title: Group title
+        users: List of InputUser objects to add (can be empty)
+        ttl_period: Auto-delete timer in seconds (optional)
+
+    Returns:
+        String representation of TL query
+    """
+    if users is None:
+        users = []
+
+    raw_method = pylogram.raw.functions.messages.CreateChat(
+        title=title,
+        users=users,
+        ttl_period=ttl_period
+    )
+
+    return raw_method_to_string(raw_method)
+
+
+def make_export_chat_invite_query(
+    peer: pylogram.raw.base.input_peer.InputPeer,
+    title: str = None,
+    expire_date: int = None,
+    usage_limit: int = None,
+    request_needed: bool = False
+) -> str:
+    """
+    Create ExportChatInvite query to get invite link for a chat.
+
+    Args:
+        peer: Input peer (chat/channel)
+        title: Optional title for the invite link
+        expire_date: Optional expiration timestamp
+        usage_limit: Optional usage limit
+        request_needed: Whether join requests are needed
+
+    Returns:
+        String representation of TL query
+    """
+    raw_method = pylogram.raw.functions.messages.ExportChatInvite(
+        peer=peer,
+        title=title,
+        expire_date=expire_date,
+        usage_limit=usage_limit,
+        request_needed=request_needed
+    )
+
+    return raw_method_to_string(raw_method)
+
+
+def make_add_chat_user_query(
+    chat_id: int,
+    user_id: int,
+    access_hash: int,
+    fwd_limit: int = 0
+) -> str:
+    """
+    Create AddChatUser query to add a user to a basic group.
+
+    Args:
+        chat_id: Chat ID (not InputPeer, just the ID)
+        user_id: User ID to add
+        access_hash: User's access hash
+        fwd_limit: Number of last messages to forward to new member
+
+    Returns:
+        String representation of TL query
+    """
+    input_user = pylogram.raw.types.InputUser(
+        user_id=user_id,
+        access_hash=access_hash
+    )
+
+    raw_method = pylogram.raw.functions.messages.AddChatUser(
+        chat_id=chat_id,
+        user_id=input_user,
+        fwd_limit=fwd_limit
+    )
+
+    return raw_method_to_string(raw_method)
+
+
+def make_input_user(user_id: int, access_hash: int) -> pylogram.raw.types.InputUser:
+    """Create InputUser for API calls"""
+    return pylogram.raw.types.InputUser(
+        user_id=user_id,
+        access_hash=access_hash
+    )
+

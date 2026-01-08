@@ -109,6 +109,83 @@ CONVERSATION_CLOSING_PROMPT = """Ты — {my_name}, {my_style} стиль об�
 ВЕРНИ ТОЛЬКО ТЕКСТ СООБЩЕНИЯ (без кавычек):"""
 
 
+GROUP_MESSAGE_PROMPT = """Ты — {my_name}, {my_age} лет, {my_occupation}.
+Характер: {my_traits}
+Стиль общения: {my_style}
+Интересы: {my_interests}
+
+ТЫ ПИШЕШЬ В ГРУППОВОЙ ЧАТ "{group_type}".
+Тема группы: {group_topic}
+
+УЧАСТНИКИ ГРУППЫ:
+{members_info}
+
+ПОСЛЕДНИЕ СООБЩЕНИЯ В ГРУППЕ:
+{recent_messages}
+
+ТВОЯ ЗАДАЧА:
+Напиши сообщение в групповой чат.
+
+ПРАВИЛА:
+1. Сообщение должно быть естественным для группового чата
+2. Можно:
+   - Отвечать на чье-то сообщение (без @-упоминаний)
+   - Задавать вопрос группе
+   - Делиться мыслью/новостью по теме
+   - Шутить если уместно
+   - Использовать эмодзи (0-2 штуки)
+3. НЕ надо:
+   - Писать @username
+   - Здороваться каждый раз
+   - Писать слишком формально
+   - Спамить вопросами
+4. Длина: 1-3 предложения
+5. Пиши на русском языке
+
+ПРИМЕРЫ ХОРОШИХ СООБЩЕНИЙ:
+- "А что вы думаете про новый сезон?"
+- "Кстати, вчера видел интересную статью про это"
+- "Согласен, я тоже так думаю"
+- "Ого, серьезно? Не знал об этом"
+- "Хаха, это точно 😄"
+
+ВЕРНИ ТОЛЬКО ТЕКСТ СООБЩЕНИЯ (без кавычек):"""
+
+
+GROUP_STARTER_PROMPT = """Ты — {my_name}, {my_age} лет, {my_occupation}.
+Стиль общения: {my_style}
+Интересы: {my_interests}
+
+ТЫ ПЕРВЫЙ ПИШЕШЬ В НОВЫЙ ГРУППОВОЙ ЧАТ "{group_type}".
+Тема группы: {group_topic}
+
+УЧАСТНИКИ ГРУППЫ:
+{members_info}
+
+ТВОЯ ЗАДАЧА:
+Напиши первое сообщение для оживления чата.
+
+ПРАВИЛА:
+1. Начни разговор естественно
+2. Можно:
+   - Предложить обсудить что-то по теме
+   - Задать вопрос группе
+   - Поделиться чем-то интересным
+3. НЕ надо:
+   - Формально приветствовать всех
+   - Писать "Привет всем!"
+   - Спрашивать "Как дела?"
+4. Длина: 1-2 предложения
+5. Пиши на русском языке
+
+ПРИМЕРЫ:
+- "Кто-нибудь смотрел вчерашний матч?"
+- "Слушайте, а что скажете про..."
+- "Видели новость про...? Интересно ваше мнение"
+
+ВЕРНИ ТОЛЬКО ТЕКСТ СООБЩЕНИЯ (без кавычек):"""
+
+
 class ConversationAgent:
     """LLM agent for generating conversation messages"""
 
@@ -306,6 +383,134 @@ class ConversationAgent:
         except Exception as e:
             logger.error(f"Error generating closing message: {e}")
             return "Окей, мне пора. До связи!"
+
+    async def generate_group_message(
+        self,
+        my_persona: Dict[str, Any],
+        group_members: List[Dict[str, Any]],
+        group_topic: str,
+        group_type: str = "friends",
+        recent_messages: List[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """
+        Generate a message for group chat.
+
+        Args:
+            my_persona: Persona of the sender
+            group_members: Personas of other group members
+            group_topic: Topic of the group
+            group_type: Type of group (friends, thematic, work)
+            recent_messages: Recent messages in the group
+
+        Returns:
+            Message text or None
+        """
+        # Format members info
+        members_info = self._format_group_members(group_members)
+
+        # Format recent messages
+        if recent_messages:
+            messages_text = self._format_group_messages(
+                recent_messages,
+                my_persona.get("generated_name", "Я")
+            )
+        else:
+            messages_text = "Пока сообщений нет"
+
+        # Choose prompt based on whether there are messages
+        is_first_message = not recent_messages or len(recent_messages) == 0
+
+        if is_first_message:
+            prompt = GROUP_STARTER_PROMPT.format(
+                my_name=my_persona.get("generated_name", "Аноним"),
+                my_age=my_persona.get("age", 25),
+                my_occupation=my_persona.get("occupation", "не указано"),
+                my_style=my_persona.get("communication_style", "дружелюбный"),
+                my_interests=", ".join(my_persona.get("interests", ["общение"])),
+                group_type=self._translate_group_type(group_type),
+                group_topic=group_topic,
+                members_info=members_info
+            )
+        else:
+            prompt = GROUP_MESSAGE_PROMPT.format(
+                my_name=my_persona.get("generated_name", "Аноним"),
+                my_age=my_persona.get("age", 25),
+                my_occupation=my_persona.get("occupation", "не указано"),
+                my_traits=", ".join(my_persona.get("personality_traits", ["дружелюбный"])),
+                my_style=my_persona.get("communication_style", "дружелюбный"),
+                my_interests=", ".join(my_persona.get("interests", ["общение"])),
+                group_type=self._translate_group_type(group_type),
+                group_topic=group_topic,
+                members_info=members_info,
+                recent_messages=messages_text
+            )
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=150,
+                temperature=0.9,
+                messages=[
+                    {"role": "system", "content": "Ты генерируешь естественные сообщения для группового чата в Telegram. Отвечай ТОЛЬКО текстом сообщения."},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+
+            text = response.choices[0].message.content.strip()
+            validated = self._validate_message(text)
+
+            if validated:
+                logger.info(f"Generated group message: {validated[:50]}...")
+                return validated
+
+            logger.warning("Generated group message failed validation")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error generating group message: {e}")
+            return None
+
+    def _format_group_members(self, members: List[Dict[str, Any]]) -> str:
+        """Format group members info for prompt"""
+        if not members:
+            return "Информация об участниках недоступна"
+
+        lines = []
+        for member in members[:5]:  # Limit to 5 members
+            name = member.get("generated_name", "Участник")
+            age = member.get("age", "?")
+            occupation = member.get("occupation", "не указано")
+            interests = ", ".join(member.get("interests", [])[:3])
+
+            lines.append(f"- {name}, {age} лет, {occupation}. Интересы: {interests}")
+
+        return "\n".join(lines) if lines else "Участники группы"
+
+    def _format_group_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        my_name: str
+    ) -> str:
+        """Format group messages for prompt"""
+        lines = []
+        for msg in messages[-10:]:  # Last 10 messages
+            sender_name = msg.get("sender_name", "Участник")
+            # Mark my messages
+            if msg.get("is_mine") or msg.get("sender_name") == my_name:
+                sender_name = "Ты"
+            text = msg.get("message_text", "")
+            lines.append(f"{sender_name}: {text}")
+
+        return "\n".join(lines) if lines else "Начало разговора"
+
+    def _translate_group_type(self, group_type: str) -> str:
+        """Translate group type to Russian"""
+        translations = {
+            "friends": "Дружеский чат",
+            "thematic": "Тематический чат",
+            "work": "Рабочий чат"
+        }
+        return translations.get(group_type, "Групповой чат")
 
     def _format_conversation_history(
         self,

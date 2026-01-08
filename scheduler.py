@@ -30,7 +30,8 @@ from database import (
 )
 from admin_sync import sync_session_statuses, get_last_sync_time, save_last_sync_time
 from conversation_engine import get_conversation_engine
-from database import count_active_conversations
+from group_engine import get_group_engine
+from database import count_active_conversations, count_active_bot_groups
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +51,15 @@ class WarmupScheduler:
         self.action_planner = ActionPlannerAgent()
         self.executor = ActionExecutor(self.telegram_client)
         self.conversation_engine = get_conversation_engine(self.telegram_client)
+        self.group_engine = get_group_engine(self.telegram_client)
 
         self.is_running = False
         self.started_at = None
         self._task = None
 
-        # Conversation settings
-        self.enable_private_conversations = True  # Enable Phase 1 DM feature
+        # Phase 1 settings
+        self.enable_private_conversations = True  # Enable Phase 1.2 DM feature
+        self.enable_group_chats = True  # Enable Phase 1.3 Group chats feature
     
     async def start(self):
         """Запустить scheduler"""
@@ -174,12 +177,19 @@ class WarmupScheduler:
                         logger.error(f"Error processing account {account.get('session_id', 'unknown')}: {e}")
                         continue
                 
-                # ========== PHASE 1: Private Conversations ==========
+                # ========== PHASE 1.2: Private Conversations ==========
                 if self.enable_private_conversations:
                     try:
                         await self._process_conversations()
                     except Exception as e:
                         logger.error(f"Error processing conversations: {e}")
+
+                # ========== PHASE 1.3: Group Chats ==========
+                if self.enable_group_chats:
+                    try:
+                        await self._process_groups()
+                    except Exception as e:
+                        logger.error(f"Error processing groups: {e}")
 
                 logger.info(f"✅ Check cycle completed. Next check in {settings.scheduler_check_interval}s")
                 logger.info("=" * 80)
@@ -473,18 +483,44 @@ class WarmupScheduler:
 
         logger.info(f"💬 Conversations processed (now {count_active_conversations()} active)")
 
+    async def _process_groups(self):
+        """
+        Process group chats between bot accounts (Phase 1.3).
+
+        - Process group activities (send messages)
+        - Create new groups for accounts without group membership
+        """
+        active_groups = count_active_bot_groups()
+        logger.info(f"👥 Processing groups... ({active_groups} active)")
+
+        # 1. Process group activities
+        messages_sent = await self.group_engine.process_group_activities()
+        if messages_sent > 0:
+            logger.info(f"   Sent {messages_sent} group messages")
+
+        # 2. Create new groups (with some probability to not spam)
+        if random.random() < 0.1:  # 10% chance per cycle
+            new_groups = await self.group_engine.initiate_new_group_activities()
+            if new_groups > 0:
+                logger.info(f"   Created {new_groups} new groups")
+
+        logger.info(f"👥 Groups processed (now {count_active_bot_groups()} active)")
+
     def get_status(self) -> Dict[str, Any]:
         """Получить статус scheduler"""
 
         accounts = get_accounts_for_warmup()
         active_conversations = count_active_conversations()
+        active_groups = count_active_bot_groups()
 
         return {
             "is_running": self.is_running,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "accounts_scheduled": len(accounts),
             "active_conversations": active_conversations,
+            "active_groups": active_groups,
             "private_conversations_enabled": self.enable_private_conversations,
+            "group_chats_enabled": self.enable_group_chats,
             "next_check_in": settings.scheduler_check_interval if self.is_running else None
         }
 

@@ -13,6 +13,10 @@ from telegram_tl_helpers import (
     make_read_history_query,
     make_import_contacts_query,
     make_send_message_query,
+    make_create_chat_query,
+    make_export_chat_invite_query,
+    make_add_chat_user_query,
+    make_input_user,
 )
 
 logger = logging.getLogger(__name__)
@@ -920,4 +924,199 @@ class TelegramAPIClient:
 
         logger.warning(f"Could not get phone for session {session_id}")
         return None
+
+    async def create_group(
+        self,
+        session_id: str,
+        title: str,
+        users: list = None
+    ) -> Dict[str, Any]:
+        """
+        Create a new basic group chat.
+
+        Args:
+            session_id: Telegram session UID of the creator
+            title: Group title
+            users: List of InputUser objects to add (can be empty)
+
+        Returns:
+            API response with chat_id and invite_link
+        """
+        query = make_create_chat_query(title=title, users=users or [])
+
+        logger.info(f"Creating group '{title}' for session {session_id}")
+
+        result = await self.invoke_raw(session_id, query)
+
+        if result.get("error"):
+            logger.error(f"Failed to create group: {result.get('error')}")
+            return result
+
+        # Extract chat_id from response
+        # Response structure can vary:
+        # - Old API: result -> chats[]
+        # - New API (types.messages.InvitedUsers): result -> updates -> chats[]
+        response_result = result.get("result", {})
+
+        # Try direct chats first (older API)
+        chats = response_result.get("chats", [])
+
+        # If not found, check inside updates (newer API)
+        if not chats:
+            updates = response_result.get("updates", {})
+            chats = updates.get("chats", [])
+
+        if not chats:
+            logger.error("No chats in create group response")
+            logger.debug(f"Response keys: {response_result.keys() if isinstance(response_result, dict) else 'not dict'}")
+            return {"error": "No chats in response", "result": response_result}
+
+        chat = chats[0]
+        chat_id = chat.get("id")
+
+        if not chat_id:
+            logger.error("No chat_id in create group response")
+            return {"error": "No chat_id in response", "result": response_result}
+
+        logger.info(f"Created group '{title}' with chat_id={chat_id}")
+
+        # Export invite link
+        invite_link = None
+        try:
+            invite_result = await self.export_chat_invite(session_id, chat_id)
+            if invite_result.get("success"):
+                invite_link = invite_result.get("invite_link")
+        except Exception as e:
+            logger.warning(f"Failed to export invite link: {e}")
+
+        return {
+            "success": True,
+            "chat_id": chat_id,
+            "invite_link": invite_link,
+            "chat": chat,
+            "result": response_result
+        }
+
+    async def export_chat_invite(
+        self,
+        session_id: str,
+        chat_id: int
+    ) -> Dict[str, Any]:
+        """
+        Export invite link for a chat.
+
+        Args:
+            session_id: Telegram session UID
+            chat_id: Chat ID
+
+        Returns:
+            API response with invite_link
+        """
+        input_peer = make_input_peer_chat(chat_id)
+        query = make_export_chat_invite_query(peer=input_peer)
+
+        logger.info(f"Exporting invite link for chat {chat_id}")
+
+        result = await self.invoke_raw(session_id, query)
+
+        if result.get("error"):
+            logger.error(f"Failed to export invite link: {result.get('error')}")
+            return result
+
+        response_result = result.get("result", {})
+        invite_link = response_result.get("link")
+
+        if invite_link:
+            logger.info(f"Exported invite link: {invite_link}")
+            return {"success": True, "invite_link": invite_link, "result": response_result}
+
+        logger.warning("No invite link in response")
+        return {"success": False, "error": "No link in response", "result": response_result}
+
+    async def add_user_to_chat(
+        self,
+        session_id: str,
+        chat_id: int,
+        user_id: int,
+        access_hash: int,
+        fwd_limit: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Add a user to a basic group chat.
+
+        Args:
+            session_id: Telegram session UID
+            chat_id: Chat ID
+            user_id: User ID to add
+            access_hash: User's access hash
+            fwd_limit: Number of last messages to forward
+
+        Returns:
+            API response
+        """
+        query = make_add_chat_user_query(
+            chat_id=chat_id,
+            user_id=user_id,
+            access_hash=access_hash,
+            fwd_limit=fwd_limit
+        )
+
+        logger.info(f"Adding user {user_id} to chat {chat_id}")
+
+        result = await self.invoke_raw(session_id, query)
+
+        if result.get("error"):
+            logger.error(f"Failed to add user to chat: {result.get('error')}")
+            return result
+
+        logger.info(f"Added user {user_id} to chat {chat_id}")
+        return {"success": True, "result": result.get("result")}
+
+    async def send_message_to_group(
+        self,
+        session_id: str,
+        chat_id: int,
+        text: str,
+        silent: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Send a message to a group chat using raw TL method.
+
+        Args:
+            session_id: Telegram session UID
+            chat_id: Chat ID (integer, not string)
+            text: Message text
+            silent: Send silently (no notification)
+
+        Returns:
+            API response with message_id
+        """
+        input_peer = make_input_peer_chat(chat_id)
+        query = make_send_message_query(
+            peer=input_peer,
+            message=text,
+            silent=silent
+        )
+
+        logger.info(f"Sending group message to chat {chat_id} for session {session_id}")
+
+        result = await self.invoke_raw(session_id, query)
+
+        if result.get("error"):
+            logger.error(f"Failed to send group message: {result.get('error')}")
+            return result
+
+        # Extract message_id from response
+        response_result = result.get("result", {})
+        message_id = None
+
+        # Try to get message_id from updates
+        updates = response_result.get("updates", [])
+        for update in updates:
+            if update.get("_") == "types.UpdateMessageID":
+                message_id = update.get("id")
+                break
+
+        logger.info(f"Group message sent, message_id={message_id}")
+        return {"success": True, "message_id": message_id, "result": response_result}
 

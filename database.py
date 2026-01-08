@@ -344,6 +344,100 @@ def init_database():
             ON conversation_messages(conversation_id, sent_at)
         """)
 
+        # ============================================
+        # BOT GROUPS (Phase 1.3)
+        # ============================================
+
+        # Create bot_groups table - private groups between bots
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                -- Telegram data
+                telegram_chat_id INTEGER,
+                telegram_invite_link TEXT,
+                group_title TEXT NOT NULL,
+                group_description TEXT,
+
+                -- Type and topic
+                group_type TEXT NOT NULL DEFAULT 'friends',  -- thematic, friends, work
+                topic TEXT,
+
+                -- Creator
+                creator_account_id INTEGER NOT NULL,
+                creator_session_id TEXT NOT NULL,
+
+                -- State
+                status TEXT DEFAULT 'active',  -- active, archived
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_activity_at DATETIME,
+
+                -- Counters
+                member_count INTEGER DEFAULT 1,
+                message_count INTEGER DEFAULT 0,
+
+                -- Scheduling
+                next_activity_after DATETIME,
+
+                FOREIGN KEY (creator_account_id) REFERENCES accounts(id)
+            )
+        """)
+
+        # Create bot_group_members table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_group_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+
+                joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_message_at DATETIME,
+                message_count INTEGER DEFAULT 0,
+
+                role TEXT DEFAULT 'member',  -- admin, member
+
+                FOREIGN KEY (group_id) REFERENCES bot_groups(id),
+                FOREIGN KEY (account_id) REFERENCES accounts(id),
+                UNIQUE(group_id, account_id)
+            )
+        """)
+
+        # Create bot_group_messages table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_group_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                sender_account_id INTEGER NOT NULL,
+
+                message_text TEXT,
+                message_type TEXT DEFAULT 'text',  -- text, sticker, photo, voice
+                reply_to_message_id INTEGER,
+
+                sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                telegram_message_id INTEGER,
+
+                FOREIGN KEY (group_id) REFERENCES bot_groups(id),
+                FOREIGN KEY (sender_account_id) REFERENCES accounts(id)
+            )
+        """)
+
+        # Indexes for bot groups
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bot_groups_status
+            ON bot_groups(status, next_activity_after)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bot_group_members
+            ON bot_group_members(group_id, account_id)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bot_group_messages
+            ON bot_group_messages(group_id, sent_at)
+        """)
+
         conn.commit()
 
     logger.info("Database initialized successfully")
@@ -1747,4 +1841,385 @@ def count_active_conversations() -> int:
     except Exception as e:
         logger.error(f"Error counting active conversations: {e}")
         return 0
+
+
+# ============================================
+# BOT GROUPS CRUD (Phase 1.3)
+# ============================================
+
+def create_bot_group(
+    creator_account_id: int,
+    creator_session_id: str,
+    group_title: str,
+    group_type: str = "friends",
+    topic: str = None,
+    group_description: str = None,
+    telegram_chat_id: int = None,
+    telegram_invite_link: str = None
+) -> Optional[int]:
+    """
+    Create a new bot group
+
+    Args:
+        creator_account_id: ID of the account creating the group
+        creator_session_id: Session ID of the creator
+        group_title: Title of the group
+        group_type: Type of group (friends, thematic, work)
+        topic: Topic of discussion
+        group_description: Description of the group
+        telegram_chat_id: Telegram chat ID (if already created)
+        telegram_invite_link: Invite link for the group
+
+    Returns:
+        Group ID if successful, None otherwise
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO bot_groups (
+                    creator_account_id, creator_session_id, group_title,
+                    group_type, topic, group_description,
+                    telegram_chat_id, telegram_invite_link, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    creator_account_id, creator_session_id, group_title,
+                    group_type, topic, group_description,
+                    telegram_chat_id, telegram_invite_link, datetime.utcnow().isoformat()
+                )
+            )
+            conn.commit()
+            group_id = cursor.lastrowid
+            logger.info(f"Created bot group {group_id}: {group_title}")
+            return group_id
+    except Exception as e:
+        logger.error(f"Error creating bot group: {e}")
+        return None
+
+
+def get_bot_group(group_id: int) -> Optional[Dict[str, Any]]:
+    """Get bot group by ID"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM bot_groups WHERE id = ?", (group_id,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+    except Exception as e:
+        logger.error(f"Error getting bot group: {e}")
+        return None
+
+
+def get_active_bot_groups(limit: int = 50) -> List[Dict[str, Any]]:
+    """Get all active bot groups"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM bot_groups
+                WHERE status = 'active'
+                ORDER BY last_activity_at ASC
+                LIMIT ?
+                """,
+                (limit,)
+            )
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting active bot groups: {e}")
+        return []
+
+
+def get_bot_groups_needing_activity() -> List[Dict[str, Any]]:
+    """Get bot groups where it's time for activity"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM bot_groups
+                WHERE status = 'active'
+                AND (next_activity_after IS NULL OR next_activity_after <= ?)
+                ORDER BY next_activity_after ASC
+                LIMIT 20
+                """,
+                (datetime.utcnow().isoformat(),)
+            )
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting bot groups needing activity: {e}")
+        return []
+
+
+def update_bot_group(group_id: int, **kwargs) -> bool:
+    """Update bot group fields"""
+    if not kwargs:
+        return True
+
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            fields = []
+            values = []
+            for key, value in kwargs.items():
+                fields.append(f"{key} = ?")
+                if isinstance(value, datetime):
+                    values.append(value.isoformat())
+                else:
+                    values.append(value)
+
+            values.append(group_id)
+
+            query = f"UPDATE bot_groups SET {', '.join(fields)} WHERE id = ?"
+            cursor.execute(query, values)
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error updating bot group: {e}")
+        return False
+
+
+def add_group_member(
+    group_id: int,
+    account_id: int,
+    session_id: str,
+    role: str = "member"
+) -> Optional[int]:
+    """Add a member to a bot group"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO bot_group_members
+                (group_id, account_id, session_id, role, joined_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (group_id, account_id, session_id, role, datetime.utcnow().isoformat())
+            )
+            conn.commit()
+
+            # Update member count
+            cursor.execute(
+                "SELECT COUNT(*) FROM bot_group_members WHERE group_id = ?",
+                (group_id,)
+            )
+            count = cursor.fetchone()[0]
+            cursor.execute(
+                "UPDATE bot_groups SET member_count = ? WHERE id = ?",
+                (count, group_id)
+            )
+            conn.commit()
+
+            return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Error adding group member: {e}")
+        return None
+
+
+def get_group_members(group_id: int) -> List[Dict[str, Any]]:
+    """Get all members of a bot group"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT m.*, a.session_id as account_session_id,
+                       p.generated_name, p.occupation, p.interests, p.communication_style
+                FROM bot_group_members m
+                JOIN accounts a ON m.account_id = a.id
+                LEFT JOIN personas p ON m.account_id = p.account_id
+                WHERE m.group_id = ?
+                ORDER BY m.joined_at
+                """,
+                (group_id,)
+            )
+            rows = cursor.fetchall()
+            members = []
+            for row in rows:
+                member = dict(row)
+                if member.get("interests"):
+                    try:
+                        member["interests"] = json.loads(member["interests"])
+                    except:
+                        pass
+                members.append(member)
+            return members
+    except Exception as e:
+        logger.error(f"Error getting group members: {e}")
+        return []
+
+
+def update_group_member(group_id: int, account_id: int, **kwargs) -> bool:
+    """Update group member fields"""
+    if not kwargs:
+        return True
+
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            fields = []
+            values = []
+            for key, value in kwargs.items():
+                fields.append(f"{key} = ?")
+                if isinstance(value, datetime):
+                    values.append(value.isoformat())
+                else:
+                    values.append(value)
+
+            values.extend([group_id, account_id])
+
+            query = f"UPDATE bot_group_members SET {', '.join(fields)} WHERE group_id = ? AND account_id = ?"
+            cursor.execute(query, values)
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error updating group member: {e}")
+        return False
+
+
+def save_group_message(
+    group_id: int,
+    sender_account_id: int,
+    message_text: str,
+    message_type: str = "text",
+    telegram_message_id: int = None,
+    reply_to_message_id: int = None
+) -> Optional[int]:
+    """Save a message sent to a bot group"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO bot_group_messages
+                (group_id, sender_account_id, message_text, message_type,
+                 telegram_message_id, reply_to_message_id, sent_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    group_id, sender_account_id, message_text, message_type,
+                    telegram_message_id, reply_to_message_id, datetime.utcnow().isoformat()
+                )
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Error saving group message: {e}")
+        return None
+
+
+def get_group_messages(group_id: int, limit: int = 30) -> List[Dict[str, Any]]:
+    """Get messages from a bot group"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT m.*, p.generated_name as sender_name
+                FROM bot_group_messages m
+                LEFT JOIN personas p ON m.sender_account_id = p.account_id
+                WHERE m.group_id = ?
+                ORDER BY m.sent_at DESC
+                LIMIT ?
+                """,
+                (group_id, limit)
+            )
+            rows = cursor.fetchall()
+            # Reverse to get chronological order
+            return [dict(row) for row in reversed(rows)]
+    except Exception as e:
+        logger.error(f"Error getting group messages: {e}")
+        return []
+
+
+def get_last_group_message(group_id: int) -> Optional[Dict[str, Any]]:
+    """Get the last message in a bot group"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT m.*, p.generated_name as sender_name
+                FROM bot_group_messages m
+                LEFT JOIN personas p ON m.sender_account_id = p.account_id
+                WHERE m.group_id = ?
+                ORDER BY m.sent_at DESC
+                LIMIT 1
+                """,
+                (group_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+    except Exception as e:
+        logger.error(f"Error getting last group message: {e}")
+        return None
+
+
+def count_active_bot_groups() -> int:
+    """Count total active bot groups"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) FROM bot_groups WHERE status = 'active'"
+            )
+            return cursor.fetchone()[0]
+    except Exception as e:
+        logger.error(f"Error counting active bot groups: {e}")
+        return 0
+
+
+def get_accounts_without_group_membership(
+    min_stage: int = MIN_STAGE_FOR_DM,
+    limit: int = 20
+) -> List[Dict[str, Any]]:
+    """Get accounts not currently in any active bot group"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT a.*, p.generated_name, p.interests, p.communication_style
+                FROM accounts a
+                LEFT JOIN personas p ON a.id = p.account_id
+                WHERE a.is_active = 1
+                AND a.is_deleted = 0
+                AND a.is_frozen = 0
+                AND a.warmup_stage >= ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM bot_group_members gm
+                    JOIN bot_groups g ON gm.group_id = g.id
+                    WHERE gm.account_id = a.id
+                    AND g.status = 'active'
+                )
+                ORDER BY RANDOM()
+                LIMIT ?
+                """,
+                (min_stage, limit)
+            )
+            rows = cursor.fetchall()
+            accounts = []
+            for row in rows:
+                acc = dict(row)
+                if acc.get("interests"):
+                    try:
+                        acc["interests"] = json.loads(acc["interests"])
+                    except:
+                        pass
+                accounts.append(acc)
+            return accounts
+    except Exception as e:
+        logger.error(f"Error getting accounts without group membership: {e}")
+        return []
 
