@@ -60,10 +60,11 @@ class ConversationEngine:
         Check if we can start a new DM to target session.
 
         Rules:
-        1. If there's already an active conversation - OK (continue it)
-        2. If target has status=1 in Admin API - CANNOT start new DM
-        3. If target is deleted/frozen/banned forever - CANNOT
-        4. Otherwise - OK
+        1. If there's already an active conversation - still check BOTH statuses
+        2. If initiator has status != 0 in Admin API - CANNOT send DM
+        3. If target has status != 0 in Admin API - CANNOT receive DM
+        4. If target is deleted/frozen/banned forever - CANNOT
+        5. Otherwise - OK
 
         Args:
             target_session_id: Session ID to check
@@ -72,12 +73,19 @@ class ConversationEngine:
         Returns:
             Tuple of (can_initiate, reason)
         """
-        # 1. Check if there's already an active conversation
-        existing = get_active_conversation(initiator_session_id, target_session_id)
-        if existing:
-            return True, "existing_conversation"
+        # 1. Check INITIATOR status first (must be status=0 to send DMs)
+        try:
+            initiator_status = await self.admin_api.check_session_status(initiator_session_id)
+            if initiator_status != 0:
+                logger.info(
+                    f"Cannot initiate DM from {initiator_session_id}: status={initiator_status} (need 0)"
+                )
+                return False, f"initiator_status_{initiator_status}_cannot_send_dm"
+        except Exception as e:
+            logger.warning(f"Admin API check failed for initiator {initiator_session_id}: {e}")
+            return False, "initiator_status_check_failed"
 
-        # 2. Check our local database first
+        # 2. Check our local database for target
         target_account = get_account(target_session_id)
         if not target_account:
             return False, "target_not_in_database"
@@ -91,20 +99,17 @@ class ConversationEngine:
         if target_account.get("is_banned") and not target_account.get("unban_date"):
             return False, "target_banned_forever"
 
-        # 3. Check Admin API for status
+        # 3. Check TARGET status in Admin API (must be status=0 to receive DMs)
         try:
-            # Get session info from Admin API by session_id string
-            status = await self.admin_api.check_session_status(target_session_id)
-
-            if status == 1:
+            target_status = await self.admin_api.check_session_status(target_session_id)
+            if target_status != 0:
                 logger.info(
-                    f"Cannot initiate DM to {target_session_id[:8]}: status=1 in Admin API"
+                    f"Cannot initiate DM to {target_session_id}: status={target_status} (need 0)"
                 )
-                return False, "target_status_1_no_dm_allowed"
-
+                return False, f"target_status_{target_status}_cannot_receive_dm"
         except Exception as e:
-            # If Admin API fails, still allow (optimistic approach)
-            logger.warning(f"Admin API check failed for {target_session_id[:8]}: {e}")
+            logger.warning(f"Admin API check failed for target {target_session_id}: {e}")
+            return False, "target_status_check_failed"
 
         return True, "ok"
 
@@ -318,13 +323,62 @@ class ConversationEngine:
             logger.error(f"Peer account has no session_id")
             return False
 
+        # 2. Check Admin API status for BOTH participants before continuing
+        try:
+            responder_status = await self.admin_api.check_session_status(responder_session_id)
+            if responder_status != 0:
+                logger.warning(
+                    f"Conversation {conversation_id}: responder {responder_session_id} has status={responder_status}, "
+                    f"ending conversation (only status=0 can participate in DMs)"
+                )
+                update_conversation(
+                    conversation_id,
+                    status="ended",
+                    end_reason=f"responder_status_{responder_status}",
+                    next_response_after=None
+                )
+                return False
+        except Exception as e:
+            logger.warning(f"Failed to check responder status: {e}, ending conversation for safety")
+            update_conversation(
+                conversation_id,
+                status="ended",
+                end_reason="status_check_failed",
+                next_response_after=None
+            )
+            return False
+
+        try:
+            peer_status = await self.admin_api.check_session_status(peer_session_id)
+            if peer_status != 0:
+                logger.warning(
+                    f"Conversation {conversation_id}: peer {peer_session_id} has status={peer_status}, "
+                    f"ending conversation (only status=0 can participate in DMs)"
+                )
+                update_conversation(
+                    conversation_id,
+                    status="ended",
+                    end_reason=f"peer_status_{peer_status}",
+                    next_response_after=None
+                )
+                return False
+        except Exception as e:
+            logger.warning(f"Failed to check peer status: {e}, ending conversation for safety")
+            update_conversation(
+                conversation_id,
+                status="ended",
+                end_reason="status_check_failed",
+                next_response_after=None
+            )
+            return False
+
         # Fetch actual phone from Telegram API (local DB may be stale)
         peer_phone = await self.telegram.get_own_phone_number(peer_session_id)
         if not peer_phone:
             logger.error(f"Could not get real phone for peer {peer_session_id[:8]}")
             return False
 
-        # 2. Check if conversation should end
+        # 3. Check if conversation should end
         if await self._should_end_conversation(conversation):
             await self._end_conversation(conversation, responder_session_id)
             return True
@@ -557,15 +611,41 @@ class ConversationEngine:
             recent_messages=messages
         )
 
-        if closing_text:
-            # Determine peer and get their info
-            if responder_session_id == conversation["initiator_session_id"]:
-                peer_account_id = conversation["responder_account_id"]
-                peer_session_id = conversation["responder_session_id"]
-            else:
-                peer_account_id = conversation["initiator_account_id"]
-                peer_session_id = conversation["initiator_session_id"]
+        # Determine peer first
+        if responder_session_id == conversation["initiator_session_id"]:
+            peer_account_id = conversation["responder_account_id"]
+            peer_session_id = conversation["responder_session_id"]
+        else:
+            peer_account_id = conversation["initiator_account_id"]
+            peer_session_id = conversation["initiator_session_id"]
 
+        # Check BOTH statuses before sending closing message
+        can_send_closing = closing_text is not None
+        if can_send_closing:
+            try:
+                responder_status = await self.admin_api.check_session_status(responder_session_id)
+                if responder_status != 0:
+                    logger.info(
+                        f"Cannot send closing message: responder {responder_session_id} has status={responder_status}"
+                    )
+                    can_send_closing = False
+            except Exception as e:
+                logger.warning(f"Failed to check responder status for closing: {e}")
+                can_send_closing = False
+
+        if can_send_closing:
+            try:
+                peer_status = await self.admin_api.check_session_status(peer_session_id)
+                if peer_status != 0:
+                    logger.info(
+                        f"Cannot send closing message: peer {peer_session_id} has status={peer_status}"
+                    )
+                    can_send_closing = False
+            except Exception as e:
+                logger.warning(f"Failed to check peer status for closing: {e}")
+                can_send_closing = False
+
+        if can_send_closing:
             # Get peer's actual phone from Telegram API
             peer_phone = await self.telegram.get_own_phone_number(peer_session_id)
             if peer_phone:
@@ -586,13 +666,13 @@ class ConversationEngine:
                         message=closing_text
                     )
 
-            # Save message
-            if responder_account:
-                save_conversation_message(
-                    conversation_id=conversation_id,
-                    sender_account_id=responder_account["id"],
-                    message_text=closing_text
-                )
+                    # Save message only if sent
+                    if responder_account:
+                        save_conversation_message(
+                            conversation_id=conversation_id,
+                            sender_account_id=responder_account["id"],
+                            message_text=closing_text
+                        )
 
         # Mark conversation as ended
         update_conversation(
