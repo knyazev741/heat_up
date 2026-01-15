@@ -27,7 +27,8 @@ from models import (
 from database import (
     add_account, get_account, get_account_by_id, get_all_accounts,
     update_account, get_persona, get_relevant_chats, get_warmup_sessions,
-    save_persona, save_discovered_chat, wait_for_warmup_delay, check_warmup_delay
+    save_persona, save_discovered_chat, wait_for_warmup_delay, check_warmup_delay,
+    get_most_warmed_accounts
 )
 
 # Configure logging
@@ -641,6 +642,133 @@ async def list_accounts_endpoint(skip: int = 0, limit: int = 50, active_only: bo
         }
     except Exception as e:
         logger.error(f"Error listing accounts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/accounts/best-warmed")
+async def get_best_warmed_account_endpoint(
+    country: Optional[str] = None,
+    countries: Optional[str] = None,
+    exclude_countries: Optional[str] = None,
+    token_info: dict = Depends(verify_api_token)
+):
+    """
+    Get the best warmed account that is ready for use.
+
+    Returns the account with highest warmup_stage that:
+    - Has status=0 in Admin API (active)
+    - Has is_premium=false in Admin API (not premium)
+    - Is active in local DB (not banned/frozen/deleted)
+    - Matches country filters (if specified)
+
+    Query parameters:
+    - country: Single country to filter (e.g., "Ukraine")
+    - countries: Comma-separated list of allowed countries (e.g., "Ukraine,Russia")
+    - exclude_countries: Comma-separated list of countries to exclude (e.g., "Iran,Russia")
+
+    Requires API token authentication.
+
+    Returns:
+        Account data with session_id, warmup_stage, country, etc.
+        Returns 404 if no suitable account found.
+    """
+    try:
+        # Parse country filters
+        allowed_countries = None
+        excluded_countries = None
+
+        if country:
+            allowed_countries = [country.strip()]
+        elif countries:
+            allowed_countries = [c.strip() for c in countries.split(",") if c.strip()]
+
+        if exclude_countries:
+            excluded_countries = [c.strip() for c in exclude_countries.split(",") if c.strip()]
+
+        # Get top 50 most warmed accounts from local DB (more to filter)
+        candidates = get_most_warmed_accounts(limit=50)
+
+        if not candidates:
+            raise HTTPException(
+                status_code=404,
+                detail="No active warmup accounts found"
+            )
+
+        # Filter by country in local DB first
+        if allowed_countries:
+            allowed_lower = [c.lower() for c in allowed_countries]
+            candidates = [
+                a for a in candidates
+                if a.get("country", "").lower() in allowed_lower
+            ]
+
+        if excluded_countries:
+            excluded_lower = [c.lower() for c in excluded_countries]
+            candidates = [
+                a for a in candidates
+                if a.get("country", "").lower() not in excluded_lower
+            ]
+
+        if not candidates:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No accounts found matching country filters"
+            )
+
+        # Check each candidate against Admin API
+        admin_client = AdminAPIClient()
+        try:
+            for account in candidates:
+                session_id = account.get("session_id")
+                try:
+                    session_id_int = int(session_id)
+                    admin_data = await admin_client.get_session_by_id(session_id_int)
+
+                    if not admin_data:
+                        continue
+
+                    # Check status=0 and is_premium=false
+                    status = admin_data.get("status")
+                    is_premium = admin_data.get("is_premium", False)
+
+                    if status == 0 and not is_premium:
+                        logger.info(
+                            f"Found best warmed account: session_id={session_id}, "
+                            f"warmup_stage={account.get('warmup_stage')}, "
+                            f"country={account.get('country')}"
+                        )
+                        return {
+                            "success": True,
+                            "account": {
+                                "id": account.get("id"),
+                                "session_id": session_id,
+                                "phone_number": admin_data.get("phone_number"),
+                                "country": account.get("country"),
+                                "warmup_stage": account.get("warmup_stage"),
+                                "first_warmup_date": account.get("first_warmup_date"),
+                                "total_warmups": account.get("total_warmups"),
+                                "total_actions": account.get("total_actions"),
+                                "joined_channels_count": account.get("joined_channels_count"),
+                                "telegram_id": admin_data.get("telegram_id"),
+                                "status": status,
+                                "is_premium": is_premium,
+                            }
+                        }
+                except (ValueError, TypeError):
+                    continue
+
+            # No suitable account found
+            raise HTTPException(
+                status_code=404,
+                detail="No account found with status=0 and is_premium=false"
+            )
+        finally:
+            await admin_client.close()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting best warmed account: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

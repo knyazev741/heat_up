@@ -75,19 +75,38 @@ def make_join_channel_query(username: str) -> str:
 def make_resolve_username_query(username: str) -> str:
     """
     Create ResolveUsername query to get channel/user info by username
-    
+
     Args:
         username: Username (with or without @)
-        
+
     Returns:
         String representation of TL query
     """
     username = username.lstrip('@')
-    
+
     raw_method = pylogram.raw.functions.contacts.ResolveUsername(
         username=username
     )
-    
+
+    return raw_method_to_string(raw_method)
+
+
+def make_update_username_query(username: str) -> str:
+    """
+    Create UpdateUsername query to set/update user's own username
+
+    Args:
+        username: New username (without @), or empty string to remove
+
+    Returns:
+        String representation of TL query
+    """
+    username = username.lstrip('@')
+
+    raw_method = pylogram.raw.functions.account.UpdateUsername(
+        username=username
+    )
+
     return raw_method_to_string(raw_method)
 
 

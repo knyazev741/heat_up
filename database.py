@@ -931,6 +931,43 @@ def get_all_accounts(
         return []
 
 
+def get_most_warmed_accounts(limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Get accounts sorted by warmup progress (most warmed first).
+
+    Returns active warmup accounts ordered by:
+    1. warmup_stage DESC (higher stage = more warmed)
+    2. first_warmup_date ASC (longer in warmup = priority)
+
+    Args:
+        limit: Number of accounts to return
+
+    Returns:
+        List of account dicts sorted by warmup progress
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            query = """
+                SELECT * FROM accounts
+                WHERE is_active = 1
+                  AND is_deleted = 0
+                  AND is_frozen = 0
+                  AND is_banned = 0
+                  AND account_type = 'warmup'
+                ORDER BY warmup_stage DESC, first_warmup_date ASC
+                LIMIT ?
+            """
+
+            cursor.execute(query, (limit,))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting most warmed accounts: {e}")
+        return []
+
+
 def should_skip_warmup(account: Dict[str, Any]) -> tuple[bool, str]:
     """
     Проверить, нужно ли пропустить прогрев сессии
