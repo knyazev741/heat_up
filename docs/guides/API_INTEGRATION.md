@@ -110,9 +110,9 @@ Content-Type: application/json
 
 ---
 
-### 2. Получить лучшую прогретую сессию
+### 2. Получить лучшие прогретые сессии
 
-Возвращает наиболее прогретую сессию, готовую к использованию.
+Возвращает наиболее прогретые сессии, готовые к использованию.
 
 ```
 GET /accounts/best-warmed
@@ -127,11 +127,12 @@ GET /accounts/best-warmed
 
 #### Query Parameters
 
-| Параметр | Тип | Описание |
-|----------|-----|----------|
-| `country` | string | Фильтр по одной стране (например: `Ukraine`) |
-| `countries` | string | Фильтр по нескольким странам через запятую (например: `Ukraine,Russia`) |
-| `exclude_countries` | string | Исключить страны через запятую (например: `Iran,Russia`) |
+| Параметр | Тип | По умолчанию | Описание |
+|----------|-----|--------------|----------|
+| `limit` | int | 1 | Количество сессий (1-50) |
+| `country` | string | - | Фильтр по одной стране (например: `Ukraine`) |
+| `countries` | string | - | Фильтр по нескольким странам через запятую (например: `Ukraine,Russia`) |
+| `exclude_countries` | string | - | Исключить страны через запятую (например: `Iran,Russia`) |
 
 #### Request
 
@@ -143,39 +144,77 @@ Authorization: Bearer <API_TOKEN>
 **Примеры:**
 
 ```bash
-# Без фильтров - вернёт самую прогретую из всех
+# Одна лучшая сессия (по умолчанию)
 GET /accounts/best-warmed
 
-# Только Украина
-GET /accounts/best-warmed?country=Ukraine
+# Топ-3 украинских сессий
+GET /accounts/best-warmed?limit=3&country=Ukraine
 
-# Украина или Россия
-GET /accounts/best-warmed?countries=Ukraine,Russia
+# Топ-10 сессий кроме России
+GET /accounts/best-warmed?limit=10&exclude_countries=Russia
 
-# Все кроме России и Ирана
-GET /accounts/best-warmed?exclude_countries=Russia,Iran
+# Топ-5 из Украины или Казахстана
+GET /accounts/best-warmed?limit=5&countries=Ukraine,Kazakhstan
 ```
 
-#### Response (Success)
+#### Response (Success - limit=1)
 
 **HTTP 200**
 ```json
 {
   "success": true,
   "account": {
-    "id": 100,
-    "session_id": "27167",
-    "phone_number": "380934578018",
+    "id": 34,
+    "session_id": "27060",
+    "phone_number": "380735768070",
     "country": "Ukraine",
     "warmup_stage": 14,
-    "first_warmup_date": "2025-12-26 10:49:32.618650",
-    "total_warmups": 108,
-    "total_actions": 1057,
-    "joined_channels_count": 2,
-    "telegram_id": 8116891095,
+    "first_warmup_date": "2025-10-22 09:30:18.803004",
+    "total_warmups": 256,
+    "total_actions": 2667,
+    "joined_channels_count": 11,
+    "telegram_id": 8352274720,
     "status": 0,
     "is_premium": false
   }
+}
+```
+
+#### Response (Success - limit>1)
+
+**HTTP 200**
+```json
+{
+  "success": true,
+  "count": 3,
+  "accounts": [
+    {
+      "id": 34,
+      "session_id": "27060",
+      "phone_number": "380735768070",
+      "country": "Ukraine",
+      "warmup_stage": 14,
+      "first_warmup_date": "2025-10-22 09:30:18.803004",
+      "total_warmups": 256,
+      "total_actions": 2667,
+      "joined_channels_count": 11,
+      "telegram_id": 8352274720,
+      "status": 0,
+      "is_premium": false
+    },
+    {
+      "id": 37,
+      "session_id": "27063",
+      "phone_number": "380930429940",
+      "country": "Ukraine",
+      "warmup_stage": 14,
+      "total_warmups": 295,
+      "total_actions": 3037,
+      "telegram_id": 8448636390,
+      "status": 0,
+      "is_premium": false
+    }
+  ]
 }
 ```
 
@@ -235,9 +274,9 @@ async def add_session(session_id: int):
         return response.json()
 
 
-async def get_best_session(country: str = None, exclude: list = None):
-    """Получить лучшую прогретую сессию"""
-    params = {}
+async def get_best_sessions(limit: int = 1, country: str = None, exclude: list = None):
+    """Получить лучшие прогретые сессии"""
+    params = {"limit": limit}
     if country:
         params["country"] = country
     if exclude:
@@ -254,8 +293,9 @@ async def get_best_session(country: str = None, exclude: list = None):
 
 # Примеры использования
 result = await add_session(27190)
-best = await get_best_session(country="Ukraine")
-best_no_russia = await get_best_session(exclude=["Russia", "Iran"])
+best = await get_best_sessions(country="Ukraine")              # 1 сессия
+top3 = await get_best_sessions(limit=3, country="Ukraine")     # топ-3
+top10 = await get_best_sessions(limit=10, exclude=["Russia"])  # топ-10 без России
 ```
 
 ### curl
@@ -271,8 +311,12 @@ curl -X POST "https://heatup.knyazservice.com/accounts/add" \
 curl "https://heatup.knyazservice.com/accounts/best-warmed?country=Ukraine" \
   -H "Authorization: Bearer $HEATUP_TOKEN"
 
-# Получить лучшую сессию кроме России
-curl "https://heatup.knyazservice.com/accounts/best-warmed?exclude_countries=Russia" \
+# Получить топ-5 украинских сессий
+curl "https://heatup.knyazservice.com/accounts/best-warmed?limit=5&country=Ukraine" \
+  -H "Authorization: Bearer $HEATUP_TOKEN"
+
+# Получить топ-10 сессий кроме России
+curl "https://heatup.knyazservice.com/accounts/best-warmed?limit=10&exclude_countries=Russia" \
   -H "Authorization: Bearer $HEATUP_TOKEN"
 ```
 
@@ -292,10 +336,17 @@ curl "https://heatup.knyazservice.com/accounts/best-warmed?exclude_countries=Rus
 
 ## Доступные страны
 
-Основные страны в системе прогрева:
-- `Russia`
-- `Ukraine`
-- `Iran`
-- `Kazakhstan`
+Страны в системе прогрева:
+- `Ukraine` (47)
+- `Russia` (23)
+- `Iran` (20)
+- `Romania` (4)
+- `Kazakhstan` (4)
+- `Finland` (3)
+- `United Kingdom` (2)
+- `Portugal` (2)
+- `Czech Republic` (2)
+- `Colombia` (2)
+- `Azerbaijan` (1)
 
 *Названия стран регистронезависимые (Ukraine = ukraine = UKRAINE)*

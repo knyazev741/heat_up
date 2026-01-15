@@ -647,21 +647,23 @@ async def list_accounts_endpoint(skip: int = 0, limit: int = 50, active_only: bo
 
 @app.get("/accounts/best-warmed")
 async def get_best_warmed_account_endpoint(
+    limit: int = 1,
     country: Optional[str] = None,
     countries: Optional[str] = None,
     exclude_countries: Optional[str] = None,
     token_info: dict = Depends(verify_api_token)
 ):
     """
-    Get the best warmed account that is ready for use.
+    Get the best warmed accounts that are ready for use.
 
-    Returns the account with highest warmup_stage that:
+    Returns accounts with highest warmup_stage that:
     - Has status=0 in Admin API (active)
     - Has is_premium=false in Admin API (not premium)
     - Is active in local DB (not banned/frozen/deleted)
     - Matches country filters (if specified)
 
     Query parameters:
+    - limit: Number of accounts to return (1-50, default: 1)
     - country: Single country to filter (e.g., "Ukraine")
     - countries: Comma-separated list of allowed countries (e.g., "Ukraine,Russia")
     - exclude_countries: Comma-separated list of countries to exclude (e.g., "Iran,Russia")
@@ -669,10 +671,14 @@ async def get_best_warmed_account_endpoint(
     Requires API token authentication.
 
     Returns:
-        Account data with session_id, warmup_stage, country, etc.
+        If limit=1: Single account object in "account" field
+        If limit>1: Array of accounts in "accounts" field
         Returns 404 if no suitable account found.
     """
     try:
+        # Validate limit
+        limit = max(1, min(50, limit))
+
         # Parse country filters
         allowed_countries = None
         excluded_countries = None
@@ -685,8 +691,8 @@ async def get_best_warmed_account_endpoint(
         if exclude_countries:
             excluded_countries = [c.strip() for c in exclude_countries.split(",") if c.strip()]
 
-        # Get top 50 most warmed accounts from local DB (more to filter)
-        candidates = get_most_warmed_accounts(limit=50)
+        # Get top 100 most warmed accounts from local DB (more to filter)
+        candidates = get_most_warmed_accounts(limit=100)
 
         if not candidates:
             raise HTTPException(
@@ -715,10 +721,14 @@ async def get_best_warmed_account_endpoint(
                 detail=f"No accounts found matching country filters"
             )
 
-        # Check each candidate against Admin API
+        # Check each candidate against Admin API and collect valid ones
         admin_client = AdminAPIClient()
+        valid_accounts = []
         try:
             for account in candidates:
+                if len(valid_accounts) >= limit:
+                    break
+
                 session_id = account.get("session_id")
                 try:
                     session_id_int = int(session_id)
@@ -732,43 +742,51 @@ async def get_best_warmed_account_endpoint(
                     is_premium = admin_data.get("is_premium", False)
 
                     if status == 0 and not is_premium:
-                        logger.info(
-                            f"Found best warmed account: session_id={session_id}, "
-                            f"warmup_stage={account.get('warmup_stage')}, "
-                            f"country={account.get('country')}"
-                        )
-                        return {
-                            "success": True,
-                            "account": {
-                                "id": account.get("id"),
-                                "session_id": session_id,
-                                "phone_number": admin_data.get("phone_number"),
-                                "country": account.get("country"),
-                                "warmup_stage": account.get("warmup_stage"),
-                                "first_warmup_date": account.get("first_warmup_date"),
-                                "total_warmups": account.get("total_warmups"),
-                                "total_actions": account.get("total_actions"),
-                                "joined_channels_count": account.get("joined_channels_count"),
-                                "telegram_id": admin_data.get("telegram_id"),
-                                "status": status,
-                                "is_premium": is_premium,
-                            }
-                        }
+                        valid_accounts.append({
+                            "id": account.get("id"),
+                            "session_id": session_id,
+                            "phone_number": admin_data.get("phone_number"),
+                            "country": account.get("country"),
+                            "warmup_stage": account.get("warmup_stage"),
+                            "first_warmup_date": account.get("first_warmup_date"),
+                            "total_warmups": account.get("total_warmups"),
+                            "total_actions": account.get("total_actions"),
+                            "joined_channels_count": account.get("joined_channels_count"),
+                            "telegram_id": admin_data.get("telegram_id"),
+                            "status": status,
+                            "is_premium": is_premium,
+                        })
                 except (ValueError, TypeError):
                     continue
 
-            # No suitable account found
-            raise HTTPException(
-                status_code=404,
-                detail="No account found with status=0 and is_premium=false"
-            )
+            if not valid_accounts:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No account found with status=0 and is_premium=false"
+                )
+
+            logger.info(f"Found {len(valid_accounts)} best warmed accounts (requested: {limit})")
+
+            # Return single account or array based on limit
+            if limit == 1:
+                return {
+                    "success": True,
+                    "account": valid_accounts[0]
+                }
+            else:
+                return {
+                    "success": True,
+                    "count": len(valid_accounts),
+                    "accounts": valid_accounts
+                }
+
         finally:
             await admin_client.close()
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting best warmed account: {e}")
+        logger.error(f"Error getting best warmed accounts: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
