@@ -5,9 +5,40 @@ import json
 from typing import List, Dict, Any
 from telegram_client import TelegramAPIClient
 from config import ACTION_DELAYS
-from database import save_session_action
+from database import save_session_action, update_account, get_account, is_chat_joined, can_join_channel
 
 logger = logging.getLogger(__name__)
+
+# Critical Telegram errors that indicate session is dead/revoked
+# When these occur, session should be marked as deleted and removed from warmup
+CRITICAL_SESSION_ERRORS = [
+    "AUTH_KEY_UNREGISTERED",      # Session key was revoked/deleted
+    "SESSION_REVOKED",            # Session was explicitly revoked
+    "USER_DEACTIVATED",           # User account was deleted
+    "USER_DEACTIVATED_BAN",       # User was banned by Telegram
+    "SESSION_EXPIRED",            # Session expired
+    "AUTH_KEY_DUPLICATED",        # Auth key used in another session
+    "AUTH_KEY_PERM_EMPTY",        # Permanent auth key is empty
+]
+
+
+def _is_critical_session_error(error_text: str) -> str | None:
+    """
+    Check if error indicates a dead/revoked session
+
+    Args:
+        error_text: Error message string
+
+    Returns:
+        Error code if critical, None otherwise
+    """
+    if not error_text:
+        return None
+    error_upper = str(error_text).upper()
+    for error_code in CRITICAL_SESSION_ERRORS:
+        if error_code in error_upper:
+            return error_code
+    return None
 
 
 class ActionExecutor:
@@ -65,6 +96,24 @@ class ActionExecutor:
                     })
                     logger.error(f"❌ ACTION FAILED: {result['error']}")
                     logger.error(f"Result details: {json.dumps(result, indent=2, ensure_ascii=False)}")
+
+                    # Check for critical session errors (dead/revoked session)
+                    critical_error = _is_critical_session_error(result["error"])
+                    if critical_error:
+                        logger.error(f"🚨 CRITICAL SESSION ERROR: {critical_error}")
+                        logger.error(f"🚨 Marking session {session_id} as DELETED and stopping execution")
+                        update_account(session_id, is_deleted=True)
+                        return {
+                            "session_id": session_id,
+                            "total_actions": len(actions),
+                            "executed": idx,
+                            "successful": idx - len(errors),
+                            "failed": len(errors),
+                            "results": results,
+                            "errors": errors,
+                            "critical_error": critical_error,
+                            "session_marked_deleted": True
+                        }
                 else:
                     logger.info(f"✅ ACTION SUCCEEDED: {action_type}")
                     logger.info(f"Result: {json.dumps(result, indent=2, ensure_ascii=False)}")
@@ -169,6 +218,32 @@ class ActionExecutor:
 
         chat_type = (action.get("chat_type") or "").lower()
         logger.info(f"🚪 Attempting to join {chat_username} (type: {chat_type or 'unknown'})")
+
+        # Get account_id for spam protection checks
+        account = get_account(session_id)
+        account_id = account["id"] if account else None
+
+        # CHECK 1: Already joined?
+        if account_id and is_chat_joined(account_id, chat_username):
+            logger.info(f"✅ Already joined {chat_username}, skipping duplicate join")
+            return {
+                "action": "join_channel",
+                "chat_username": chat_username,
+                "status": "skipped",
+                "reason": "Already joined"
+            }
+
+        # CHECK 2: Rate limiting (max 3 per hour, min 10 min between joins)
+        if account_id:
+            can_join, reason = can_join_channel(account_id, max_per_hour=3, min_interval_minutes=10)
+            if not can_join:
+                logger.info(f"⏱️ Rate limit for {chat_username}: {reason}")
+                return {
+                    "action": "join_channel",
+                    "chat_username": chat_username,
+                    "status": "rate_limited",
+                    "reason": reason
+                }
 
         # Check if user has premium (required by Telegram guidelines)
         session_info = await self.telegram_client.get_session_info(session_id)

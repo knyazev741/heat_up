@@ -26,7 +26,10 @@ from database import (
     save_warmup_session,
     update_account,
     update_account_stage,
-    should_skip_warmup
+    should_skip_warmup,
+    acquire_warmup_lock,
+    release_warmup_lock,
+    cleanup_stale_warmup_locks
 )
 from admin_sync import sync_session_statuses, get_last_sync_time, save_last_sync_time, sync_helper_accounts
 from conversation_engine import get_conversation_engine
@@ -73,14 +76,19 @@ class WarmupScheduler:
         
         self.is_running = True
         self.started_at = datetime.utcnow()
-        
+
         logger.info("=" * 100)
         logger.info("🚀 WARMUP SCHEDULER STARTED")
         logger.info("=" * 100)
         logger.info(f"Check interval: {settings.scheduler_check_interval} seconds")
         logger.info(f"Started at: {self.started_at}")
         logger.info("=" * 100)
-        
+
+        # Cleanup stale warmup locks from crashed sessions
+        cleaned = cleanup_stale_warmup_locks(timeout_minutes=15)
+        if cleaned > 0:
+            logger.info(f"🧹 Cleaned {cleaned} stale warmup locks from previous crashes")
+
         # Perform initial sync from Admin API if enabled
         if settings.admin_sync_enabled:
             logger.info("🔄 Performing initial Admin API sync...")
@@ -304,26 +312,35 @@ class WarmupScheduler:
     async def warmup_account(self, account_id: int):
         """
         Полный цикл прогрева одного аккаунта
-        
+
         Args:
             account_id: ID аккаунта в базе данных
         """
-        
+        # Try to acquire warmup lock - prevents race condition
+        if not acquire_warmup_lock(account_id, timeout_minutes=15):
+            logger.warning(f"⚠️ Skipping warmup for account {account_id} - already in progress")
+            return
+
         logger.info("=" * 100)
         logger.info(f"🎯 WARMUP ACCOUNT {account_id}")
         logger.info("=" * 100)
-        
+
         start_time = datetime.utcnow()
-        
+
         try:
             # 1. Получить данные аккаунта
             account = get_account_by_id(account_id)
             if not account:
                 logger.error(f"Account {account_id} not found")
                 return
-            
+
             session_id = account["session_id"]
             warmup_stage = account.get("warmup_stage", 1)
+
+            # CRITICAL: Update last_warmup_date IMMEDIATELY to prevent race condition
+            # This ensures that even if uvicorn restarts, this account won't be picked up again
+            update_account(session_id, last_warmup_date=start_time.isoformat())
+            logger.info(f"📅 Set last_warmup_date to {start_time.isoformat()} (at START to prevent race condition)")
             
             logger.info(f"Session ID: {session_id}")
             logger.info(f"Warmup Stage: {warmup_stage}")
@@ -473,19 +490,22 @@ class WarmupScheduler:
                 except Exception as e:
                     logger.error(f"Error updating stage: {e}")
             
-            # 8. КРИТИЧЕСКИ ВАЖНО: Обновить last_warmup_date в БД
-            update_account(session_id, last_warmup_date=completed_at.isoformat())
-            logger.info(f"📅 Updated last_warmup_date: {completed_at.isoformat()}")
-            
+            # 8. last_warmup_date уже обновлён в начале функции для предотвращения race condition
+            # Здесь можно обновить время завершения если нужно
+            logger.info(f"📅 Warmup started at {start_time.isoformat()}, completed at {completed_at.isoformat()}")
+
             logger.info("=" * 100)
             logger.info(f"✅ WARMUP COMPLETED in {duration:.1f}s")
             logger.info(f"   Successful: {execution_summary.get('successful_actions', 0)}/{len(actions)}")
             logger.info(f"   Failed: {execution_summary.get('failed_actions', 0)}/{len(actions)}")
             logger.info("=" * 100)
-        
+
         except Exception as e:
             logger.error(f"❌ Error during warmup: {e}", exc_info=True)
             logger.error("=" * 100)
+        finally:
+            # ALWAYS release the warmup lock
+            release_warmup_lock(account_id)
     
     async def _process_conversations(self):
         """

@@ -117,7 +117,20 @@ def init_database():
         except sqlite3.OperationalError:
             logger.info("Adding warmup_start_delay_until column to accounts table")
             cursor.execute("ALTER TABLE accounts ADD COLUMN warmup_start_delay_until DATETIME")
-        
+
+        # Phase: Warmup lock columns to prevent race conditions
+        try:
+            cursor.execute("SELECT warmup_in_progress FROM accounts LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("Adding warmup_in_progress column to accounts table")
+            cursor.execute("ALTER TABLE accounts ADD COLUMN warmup_in_progress BOOLEAN DEFAULT 0")
+
+        try:
+            cursor.execute("SELECT warmup_started_at FROM accounts LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("Adding warmup_started_at column to accounts table")
+            cursor.execute("ALTER TABLE accounts ADD COLUMN warmup_started_at DATETIME")
+
         # Create personas table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS personas (
@@ -234,10 +247,16 @@ def init_database():
         """)
         
         cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_discovered_chats_account 
+            CREATE INDEX IF NOT EXISTS idx_discovered_chats_account
             ON discovered_chats(account_id)
         """)
-        
+
+        # UNIQUE index to prevent duplicate discovered_chats
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_discovered_chats_unique
+            ON discovered_chats(account_id, chat_username)
+        """)
+
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_warmup_sessions_account
             ON warmup_sessions(account_id)
@@ -1188,12 +1207,15 @@ def get_persona(account_id: int) -> Optional[Dict[str, Any]]:
 
 def save_discovered_chat(account_id: int, chat_data: Dict[str, Any]) -> Optional[int]:
     """
-    Save discovered chat for account
-    
+    Save discovered chat for account (UPSERT - update if exists).
+
+    Uses INSERT ... ON CONFLICT to prevent duplicates.
+    If chat already exists for this account, updates the metadata.
+
     Args:
         account_id: Account ID
         chat_data: Chat dictionary
-        
+
     Returns:
         Chat ID or None
     """
@@ -1204,9 +1226,25 @@ def save_discovered_chat(account_id: int, chat_data: Dict[str, Any]) -> Optional
                 """
                 INSERT INTO discovered_chats (
                     account_id, chat_username, chat_title, chat_description,
-                    chat_type, member_count, relevance_score, relevance_reason
+                    chat_type, member_count, relevance_score, relevance_reason,
+                    discovered_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, chat_username) DO UPDATE SET
+                    chat_title = excluded.chat_title,
+                    chat_description = excluded.chat_description,
+                    chat_type = COALESCE(excluded.chat_type, chat_type),
+                    member_count = COALESCE(excluded.member_count, member_count),
+                    relevance_score = CASE
+                        WHEN excluded.relevance_score > relevance_score
+                        THEN excluded.relevance_score
+                        ELSE relevance_score
+                    END,
+                    relevance_reason = CASE
+                        WHEN excluded.relevance_score > relevance_score
+                        THEN excluded.relevance_reason
+                        ELSE relevance_reason
+                    END
                 """,
                 (
                     account_id,
@@ -1216,11 +1254,19 @@ def save_discovered_chat(account_id: int, chat_data: Dict[str, Any]) -> Optional
                     chat_data.get("chat_type"),
                     chat_data.get("member_count"),
                     chat_data.get("relevance_score"),
-                    chat_data.get("relevance_reason")
+                    chat_data.get("relevance_reason"),
+                    datetime.utcnow().isoformat()
                 )
             )
             conn.commit()
-            return cursor.lastrowid
+
+            # Return the ID (either inserted or existing)
+            cursor.execute(
+                "SELECT id FROM discovered_chats WHERE account_id = ? AND chat_username = ?",
+                (account_id, chat_data.get("chat_username"))
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
     except Exception as e:
         logger.error(f"Error saving discovered chat: {e}")
         return None
@@ -3026,4 +3072,249 @@ def get_accounts_eligible_for_real_chat_participation(
     except Exception as e:
         logger.error(f"Error getting accounts for real chat participation: {e}")
         return []
+
+
+
+# ============================================
+# SPAM PROTECTION FUNCTIONS
+# ============================================
+
+def acquire_warmup_lock(account_id: int, timeout_minutes: int = 15) -> bool:
+    """
+    Atomically acquire warmup lock for an account.
+    
+    Prevents race condition where multiple warmup sessions start for same account.
+    Uses atomic UPDATE with WHERE condition to ensure only one caller wins.
+    
+    Args:
+        account_id: Account ID to lock
+        timeout_minutes: How long before a lock is considered stale
+        
+    Returns:
+        True if lock acquired, False if already locked
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            now = datetime.utcnow()
+            stale_threshold = now - timedelta(minutes=timeout_minutes)
+            
+            # Atomic UPDATE: only succeeds if warmup_in_progress=0 OR lock is stale
+            cursor.execute(
+                """
+                UPDATE accounts
+                SET warmup_in_progress = 1,
+                    warmup_started_at = ?
+                WHERE id = ?
+                AND (warmup_in_progress = 0 
+                     OR warmup_started_at IS NULL 
+                     OR warmup_started_at < ?)
+                """,
+                (now.isoformat(), account_id, stale_threshold.isoformat())
+            )
+            
+            # Check if update actually happened
+            if cursor.rowcount > 0:
+                logger.info(f"🔒 Acquired warmup lock for account {account_id}")
+                return True
+            else:
+                logger.warning(f"⚠️ Could not acquire warmup lock for account {account_id} - already in progress")
+                return False
+    except Exception as e:
+        logger.error(f"Error acquiring warmup lock: {e}")
+        return False
+
+
+def release_warmup_lock(account_id: int) -> bool:
+    """
+    Release warmup lock for an account.
+    
+    Args:
+        account_id: Account ID to unlock
+        
+    Returns:
+        True if successful
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE accounts
+                SET warmup_in_progress = 0,
+                    warmup_started_at = NULL
+                WHERE id = ?
+                """,
+                (account_id,)
+            )
+            logger.info(f"🔓 Released warmup lock for account {account_id}")
+            return True
+    except Exception as e:
+        logger.error(f"Error releasing warmup lock: {e}")
+        return False
+
+
+def cleanup_stale_warmup_locks(timeout_minutes: int = 15) -> int:
+    """
+    Cleanup stale warmup locks on startup.
+    
+    This handles cases where service crashed during warmup.
+    
+    Args:
+        timeout_minutes: How long before a lock is considered stale
+        
+    Returns:
+        Number of locks cleaned up
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            stale_threshold = datetime.utcnow() - timedelta(minutes=timeout_minutes)
+            
+            # Find and release stale locks
+            cursor.execute(
+                """
+                UPDATE accounts
+                SET warmup_in_progress = 0,
+                    warmup_started_at = NULL
+                WHERE warmup_in_progress = 1
+                AND (warmup_started_at IS NULL OR warmup_started_at < ?)
+                """,
+                (stale_threshold.isoformat(),)
+            )
+            
+            cleaned = cursor.rowcount
+            if cleaned > 0:
+                logger.info(f"🧹 Cleaned up {cleaned} stale warmup locks (older than {timeout_minutes} min)")
+            return cleaned
+    except Exception as e:
+        logger.error(f"Error cleaning stale warmup locks: {e}")
+        return 0
+
+
+def is_chat_joined(account_id: int, chat_username: str) -> bool:
+    """
+    Check if account has already joined a chat.
+    
+    Args:
+        account_id: Account ID
+        chat_username: Chat username (with or without @)
+        
+    Returns:
+        True if already joined
+    """
+    try:
+        # Normalize username
+        username = chat_username.lstrip('@').lower()
+        
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT is_joined FROM discovered_chats
+                WHERE account_id = ?
+                AND LOWER(REPLACE(chat_username, '@', '')) = ?
+                AND is_joined = 1
+                """,
+                (account_id, username)
+            )
+            row = cursor.fetchone()
+            return row is not None
+    except Exception as e:
+        logger.error(f"Error checking if chat joined: {e}")
+        return False
+
+
+def get_recent_joins_count(account_id: int, minutes: int = 60) -> int:
+    """
+    Count how many channels account joined in the last N minutes.
+    
+    Args:
+        account_id: Account ID
+        minutes: Time window in minutes
+        
+    Returns:
+        Number of joins in time window
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            since = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
+            
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM discovered_chats
+                WHERE account_id = ?
+                AND is_joined = 1
+                AND joined_at >= ?
+                """,
+                (account_id, since)
+            )
+            row = cursor.fetchone()
+            return row[0] if row else 0
+    except Exception as e:
+        logger.error(f"Error getting recent joins count: {e}")
+        return 0
+
+
+def get_last_join_time(account_id: int) -> Optional[datetime]:
+    """
+    Get time of last join for account.
+    
+    Args:
+        account_id: Account ID
+        
+    Returns:
+        Datetime of last join or None
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT MAX(joined_at) FROM discovered_chats
+                WHERE account_id = ?
+                AND is_joined = 1
+                """,
+                (account_id,)
+            )
+            row = cursor.fetchone()
+            if row and row[0]:
+                return datetime.fromisoformat(row[0])
+            return None
+    except Exception as e:
+        logger.error(f"Error getting last join time: {e}")
+        return None
+
+
+def can_join_channel(account_id: int, max_per_hour: int = 3, min_interval_minutes: int = 10) -> tuple:
+    """
+    Check if account can join a new channel (rate limiting).
+    
+    Args:
+        account_id: Account ID
+        max_per_hour: Maximum joins per hour
+        min_interval_minutes: Minimum minutes between joins
+        
+    Returns:
+        Tuple of (can_join: bool, reason: str)
+    """
+    try:
+        # Check hourly limit
+        recent_count = get_recent_joins_count(account_id, minutes=60)
+        if recent_count >= max_per_hour:
+            return (False, f"Hourly limit reached ({recent_count}/{max_per_hour} joins in last hour)")
+        
+        # Check minimum interval
+        last_join = get_last_join_time(account_id)
+        if last_join:
+            minutes_since = (datetime.utcnow() - last_join).total_seconds() / 60
+            if minutes_since < min_interval_minutes:
+                wait_minutes = min_interval_minutes - minutes_since
+                return (False, f"Too soon since last join ({minutes_since:.1f} min ago, need {min_interval_minutes} min interval)")
+        
+        return (True, f"OK ({recent_count}/{max_per_hour} joins this hour)")
+    except Exception as e:
+        logger.error(f"Error checking can_join_channel: {e}")
+        return (True, "Error checking rate limit, allowing join")
 

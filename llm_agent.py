@@ -56,8 +56,21 @@ class ActionPlannerAgent:
             all_chats = get_relevant_chats(account_id, limit=50)
             logger.info(f"📊 get_relevant_chats({account_id}) returned {len(all_chats)} chats")
             # ФИЛЬТР: ТОЛЬКО каналы с relevance_score >= 0.4
-            relevant_chats = [ch for ch in all_chats if ch.get('relevance_score', 0) >= 0.4]
-            logger.info(f"📊 After filtering (>=0.4): {len(relevant_chats)} chats")
+            filtered_chats = [ch for ch in all_chats if ch.get('relevance_score', 0) >= 0.4]
+            logger.info(f"📊 After filtering (>=0.4): {len(filtered_chats)} chats")
+
+            # ДЕДУПЛИКАЦИЯ: убираем дубликаты по chat_username (case-insensitive)
+            seen_usernames = set()
+            relevant_chats = []
+            for ch in filtered_chats:
+                username = (ch.get('chat_username') or '').lower().lstrip('@')
+                if username and username not in seen_usernames:
+                    seen_usernames.add(username)
+                    relevant_chats.append(ch)
+
+            if len(relevant_chats) < len(filtered_chats):
+                logger.info(f"📊 After deduplication: {len(relevant_chats)} unique chats (removed {len(filtered_chats) - len(relevant_chats)} duplicates)")
+
             if relevant_chats:
                 for i, ch in enumerate(relevant_chats[:5]):
                     logger.info(f"  {i+1}. {ch.get('chat_username')} (score: {ch.get('relevance_score', 0):.2f})")
@@ -546,14 +559,15 @@ class ActionPlannerAgent:
     def _validate_actions(self, actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Validate and sanitize actions from LLM"""
         validated = []
-        
+        seen_join_channels = set()  # Track unique join_channel targets for deduplication
+
         valid_actions = {
             "update_profile", "join_channel", "read_messages", "idle",
             "react_to_message", "message_bot", "view_profile",
             "reply_in_chat", "sync_contacts", "update_privacy",
             "create_group", "forward_message", "reply_to_dm"
         }
-        
+
         for action in actions:
             if not isinstance(action, dict):
                 continue
@@ -591,6 +605,13 @@ class ActionPlannerAgent:
             elif action_type in {"join_channel", "join_chat"}:
                 username = action.get("chat_username") or action.get("channel_username")
                 if username:
+                    # Deduplicate join_channel actions
+                    username_lower = username.lower().lstrip('@')
+                    if username_lower in seen_join_channels:
+                        logger.warning(f"🔄 Duplicate join_channel for @{username_lower}, skipping")
+                        continue
+                    seen_join_channels.add(username_lower)
+
                     action["chat_username"] = username
                     action["channel_username"] = username
                     action["action"] = "join_channel"
