@@ -522,8 +522,8 @@ class WarmupScheduler:
         if responses_sent > 0:
             logger.info(f"   Sent {responses_sent} conversation responses")
 
-        # 2. Start new conversations (with some probability to not spam)
-        if random.random() < 0.3:  # 30% chance per cycle
+        # 2. Start new conversations (higher probability for more social activity)
+        if random.random() < 0.7:  # 70% chance per cycle
             new_convs = await self.conversation_engine.initiate_new_social_activities()
             if new_convs > 0:
                 logger.info(f"   Started {new_convs} new conversations")
@@ -545,8 +545,8 @@ class WarmupScheduler:
         if messages_sent > 0:
             logger.info(f"   Sent {messages_sent} group messages")
 
-        # 2. Create new groups (with some probability to not spam)
-        if random.random() < 0.1:  # 10% chance per cycle
+        # 2. Create new groups (moderate probability for warmup-helper groups)
+        if random.random() < 0.3:  # 30% chance per cycle
             new_groups = await self.group_engine.initiate_new_group_activities()
             if new_groups > 0:
                 logger.info(f"   Created {new_groups} new groups")

@@ -2,11 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install build dependencies for tgcrypto and curl for healthcheck
+# Install build dependencies for tgcrypto, curl for healthcheck, and libffi for bcrypt
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     build-essential \
     curl \
+    libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies

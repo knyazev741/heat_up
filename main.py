@@ -31,6 +31,9 @@ from database import (
     get_most_warmed_accounts
 )
 
+# Dashboard integration flag
+DASHBOARD_ENABLED = True
+
 # Configure logging
 # Create logs directory if it doesn't exist
 import os
@@ -126,8 +129,23 @@ app = FastAPI(
     title="Heat Up - Telegram Session Warmup Service",
     description="Simulates natural user behavior for new Telegram accounts using LLM-generated actions",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
 )
+
+
+# Initialize Dashboard (NiceGUI) at /dashboard/
+if DASHBOARD_ENABLED:
+    try:
+        from dashboard.app import init_dashboard
+        init_dashboard(app)
+        logger.info("Dashboard enabled at /dashboard/")
+    except ImportError as e:
+        logger.warning(f"Dashboard not available: {e}")
+    except Exception as e:
+        logger.error(f"Failed to initialize dashboard: {e}")
 
 
 class WarmupResponse(BaseModel):
@@ -169,7 +187,8 @@ async def health():
 async def warmup_session(
     session_id: str,
     background_tasks: BackgroundTasks,
-    request: Optional[WarmupRequest] = None
+    request: Optional[WarmupRequest] = None,
+    token_info: dict = Depends(verify_api_token)
 ):
     """
     Warm up a Telegram session by simulating natural new user behavior
@@ -278,7 +297,8 @@ async def warmup_session(
 @app.post("/warmup-sync/{session_id}", response_model=WarmupResponse)
 async def warmup_session_sync(
     session_id: str,
-    request: Optional[WarmupRequest] = None
+    request: Optional[WarmupRequest] = None,
+    token_info: dict = Depends(verify_api_token)
 ):
     """
     Warm up a Telegram session synchronously (waits for completion)
@@ -367,7 +387,7 @@ async def warmup_session_sync(
 
 
 @app.get("/sessions/{session_id}/history")
-async def get_session_history_endpoint(session_id: str, days: int = 30):
+async def get_session_history_endpoint(session_id: str, days: int = 30, token_info: dict = Depends(verify_api_token)):
     """
     Get session history for a specific session
     
@@ -620,7 +640,7 @@ async def add_account_endpoint(
 
 
 @app.get("/accounts")
-async def list_accounts_endpoint(skip: int = 0, limit: int = 50, active_only: bool = False):
+async def list_accounts_endpoint(skip: int = 0, limit: int = 50, active_only: bool = False, token_info: dict = Depends(verify_api_token)):
     """
     List all accounts with pagination
     
@@ -791,13 +811,13 @@ async def get_best_warmed_account_endpoint(
 
 
 @app.get("/accounts/{account_id}")
-async def get_account_details_endpoint(account_id: int):
+async def get_account_details_endpoint(account_id: int, token_info: dict = Depends(verify_api_token)):
     """
     Get detailed information about an account
-    
+
     Args:
         account_id: Account ID
-        
+
     Returns:
         Detailed account information with persona, chats, and recent sessions
     """
@@ -825,13 +845,13 @@ async def get_account_details_endpoint(account_id: int):
 
 
 @app.post("/accounts/{account_id}/generate-persona")
-async def generate_persona_endpoint(account_id: int):
+async def generate_persona_endpoint(account_id: int, token_info: dict = Depends(verify_api_token)):
     """
     Generate or regenerate persona for an account
-    
+
     Args:
         account_id: Account ID
-        
+
     Returns:
         Generated persona
     """
@@ -866,13 +886,13 @@ async def generate_persona_endpoint(account_id: int):
 
 
 @app.post("/accounts/{account_id}/refresh-chats")
-async def refresh_chats_endpoint(account_id: int):
+async def refresh_chats_endpoint(account_id: int, token_info: dict = Depends(verify_api_token)):
     """
     Refresh/discover relevant chats for account's persona
-    
+
     Args:
         account_id: Account ID
-        
+
     Returns:
         List of discovered chats
     """
@@ -909,14 +929,14 @@ async def refresh_chats_endpoint(account_id: int):
 
 
 @app.post("/accounts/{account_id}/warmup-now")
-async def warmup_account_now_endpoint(account_id: int, request: WarmupNowRequest = WarmupNowRequest()):
+async def warmup_account_now_endpoint(account_id: int, request: WarmupNowRequest = WarmupNowRequest(), token_info: dict = Depends(verify_api_token)):
     """
     Trigger warmup for an account immediately (outside schedule)
-    
+
     Args:
         account_id: Account ID
         request: WarmupNowRequest with optional force flag
-        
+
     Returns:
         Warmup result
     """
@@ -944,14 +964,14 @@ async def warmup_account_now_endpoint(account_id: int, request: WarmupNowRequest
 
 
 @app.post("/accounts/{account_id}/update")
-async def update_account_endpoint(account_id: int, request: UpdateAccountRequest):
+async def update_account_endpoint(account_id: int, request: UpdateAccountRequest, token_info: dict = Depends(verify_api_token)):
     """
     Update account settings
-    
+
     Args:
         account_id: Account ID
         request: UpdateAccountRequest with fields to update
-        
+
     Returns:
         Updated account
     """
@@ -995,13 +1015,13 @@ async def update_account_endpoint(account_id: int, request: UpdateAccountRequest
 
 
 @app.delete("/accounts/{account_id}")
-async def delete_account_endpoint(account_id: int):
+async def delete_account_endpoint(account_id: int, token_info: dict = Depends(verify_api_token)):
     """
     Delete account from warmup system (not from Telegram!)
-    
+
     Args:
         account_id: Account ID
-        
+
     Returns:
         Success response
     """
@@ -1032,7 +1052,7 @@ async def delete_account_endpoint(account_id: int):
 # ========== SCHEDULER ENDPOINTS ==========
 
 @app.post("/scheduler/start")
-async def start_scheduler_endpoint():
+async def start_scheduler_endpoint(token_info: dict = Depends(verify_api_token)):
     """Start the warmup scheduler"""
     try:
         if warmup_scheduler.is_running:
@@ -1056,7 +1076,7 @@ async def start_scheduler_endpoint():
 
 
 @app.post("/scheduler/stop")
-async def stop_scheduler_endpoint():
+async def stop_scheduler_endpoint(token_info: dict = Depends(verify_api_token)):
     """Stop the warmup scheduler"""
     try:
         if not warmup_scheduler.is_running:
@@ -1080,7 +1100,7 @@ async def stop_scheduler_endpoint():
 
 
 @app.get("/scheduler/status")
-async def get_scheduler_status_endpoint():
+async def get_scheduler_status_endpoint(token_info: dict = Depends(verify_api_token)):
     """Get scheduler status"""
     try:
         status = warmup_scheduler.get_status()
@@ -1093,10 +1113,10 @@ async def get_scheduler_status_endpoint():
 # ========== STATISTICS AND MONITORING ==========
 
 @app.get("/statistics")
-async def get_statistics_endpoint():
+async def get_statistics_endpoint(token_info: dict = Depends(verify_api_token)):
     """
     Get overall statistics
-    
+
     Returns:
         System-wide statistics
     """
@@ -1109,10 +1129,10 @@ async def get_statistics_endpoint():
 
 
 @app.get("/statistics/daily")
-async def get_daily_report_endpoint():
+async def get_daily_report_endpoint(token_info: dict = Depends(verify_api_token)):
     """
     Get daily report
-    
+
     Returns:
         Report for last 24 hours
     """
@@ -1125,13 +1145,13 @@ async def get_daily_report_endpoint():
 
 
 @app.get("/accounts/{account_id}/health")
-async def check_account_health_endpoint(account_id: int):
+async def check_account_health_endpoint(account_id: int, token_info: dict = Depends(verify_api_token)):
     """
     Check account health
-    
+
     Args:
         account_id: Account ID
-        
+
     Returns:
         Health report with score and recommendations
     """
@@ -1144,13 +1164,13 @@ async def check_account_health_endpoint(account_id: int):
 
 
 @app.post("/accounts/{account_id}/refresh-channels")
-async def refresh_channels_endpoint(account_id: int):
+async def refresh_channels_endpoint(account_id: int, token_info: dict = Depends(verify_api_token)):
     """
     Принудительно запустить поиск новых каналов для аккаунта
-    
+
     Args:
         account_id: Account ID
-        
+
     Returns:
         Список новых найденных каналов
     """
@@ -1200,10 +1220,10 @@ async def refresh_channels_endpoint(account_id: int):
 
 
 @app.post("/refresh-all-low-channel-accounts")
-async def refresh_all_low_channel_accounts_endpoint():
+async def refresh_all_low_channel_accounts_endpoint(token_info: dict = Depends(verify_api_token)):
     """
     Принудительно обновить каналы для всех аккаунтов с малым количеством каналов (< 5)
-    
+
     Returns:
         Результаты обновления
     """

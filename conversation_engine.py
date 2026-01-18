@@ -18,6 +18,7 @@ from database import (
     save_conversation_message, get_conversation_messages,
     get_last_conversation_message, get_accounts_without_active_conversations,
     get_potential_conversation_partners, count_active_conversations,
+    get_accounts_for_social_activity, calculate_social_probability,
     MIN_STAGE_FOR_DM
 )
 from conversation_agent import get_conversation_agent
@@ -686,36 +687,51 @@ class ConversationEngine:
 
     async def initiate_new_social_activities(self) -> int:
         """
-        Find lonely accounts and start new conversations for them.
+        Find warmup accounts and start new conversations with helpers/other warmups.
+
+        Uses per-account probability based on existing connections:
+        - Fewer connections = higher chance to initiate
+        - Higher stage = higher chance to initiate
+        - Prefers helpers as partners (warmup -> helper connections)
 
         Returns:
             Number of new conversations started
         """
-        # Check if we have room for more conversations
-        active_count = count_active_conversations()
-        if active_count >= self.max_active_conversations:
-            logger.debug(
-                f"Max conversations reached ({active_count}/{self.max_active_conversations})"
-            )
-            return 0
+        import random
 
-        # Get accounts that need more conversations
-        lonely_accounts = get_accounts_without_active_conversations(
+        # Get accounts eligible for social activity (sorted by priority)
+        eligible_accounts = get_accounts_for_social_activity(
             min_stage=MIN_STAGE_FOR_DM,
-            max_active_conversations=self.max_conversations_per_account
+            max_active_conversations=self.max_conversations_per_account,
+            limit=30  # Get more accounts, we'll filter by probability
         )
 
-        if not lonely_accounts:
+        if not eligible_accounts:
+            logger.debug("No eligible accounts for social activity")
             return 0
 
         new_conversations = 0
-        max_new_per_cycle = 3  # Don't create too many at once
+        max_new_per_cycle = 5  # Increased from 3
 
-        for account in lonely_accounts[:max_new_per_cycle]:
-            # Find a conversation partner
+        for account in eligible_accounts:
+            if new_conversations >= max_new_per_cycle:
+                break
+
+            # Calculate probability based on existing connections
+            total_convs = account.get("total_conversations", 0)
+            stage = account.get("warmup_stage", 1)
+            probability = calculate_social_probability(total_convs, stage)
+
+            # Roll the dice
+            if random.random() > probability:
+                continue
+
+            # Find a conversation partner (prefer helpers)
             partners = get_potential_conversation_partners(
                 initiator_session_id=account["session_id"],
-                limit=5
+                limit=10,
+                include_helpers=True,
+                prefer_helpers=True  # Helpers first!
             )
 
             if not partners:
@@ -729,6 +745,9 @@ class ConversationEngine:
                 )
 
                 if not can_dm:
+                    logger.debug(
+                        f"Cannot DM {account['session_id'][:8]} -> {partner['session_id'][:8]}: {reason}"
+                    )
                     continue
 
                 # Start conversation
@@ -738,14 +757,17 @@ class ConversationEngine:
                 )
 
                 if result:
+                    partner_type = partner.get("account_type", "unknown")
+                    logger.info(
+                        f"Started conversation: warmup {account['session_id'][:8]} -> "
+                        f"{partner_type} {partner['session_id'][:8]} "
+                        f"(initiator has {total_convs} existing convs)"
+                    )
                     new_conversations += 1
                     break
 
-            if new_conversations >= max_new_per_cycle:
-                break
-
         if new_conversations > 0:
-            logger.info(f"Started {new_conversations} new conversations")
+            logger.info(f"Started {new_conversations} new conversations this cycle")
 
         return new_conversations
 

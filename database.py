@@ -2004,21 +2004,136 @@ def get_accounts_without_active_conversations(
         return []
 
 
+def get_accounts_for_social_activity(
+    min_stage: int = MIN_STAGE_FOR_DM,
+    max_active_conversations: int = 3,
+    limit: int = 20
+) -> List[Dict[str, Any]]:
+    """
+    Get warmup accounts eligible to initiate social activities.
+
+    Returns accounts with probability score based on:
+    - Fewer total connections = higher priority
+    - Higher warmup stage = higher priority
+    - Fewer active conversations = higher priority
+
+    Args:
+        min_stage: Minimum warmup stage required
+        max_active_conversations: Max active conversations per account
+        limit: Maximum accounts to return
+
+    Returns:
+        List of account dicts with 'social_priority' score
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT a.*, p.generated_name, p.interests, p.communication_style,
+                    COALESCE(active_conv.cnt, 0) as active_conversations,
+                    COALESCE(total_conv.cnt, 0) as total_conversations,
+                    -- Priority score: higher is better
+                    -- Stage contributes positively, total connections negatively
+                    (a.warmup_stage * 2) - COALESCE(total_conv.cnt, 0) * 3 - COALESCE(active_conv.cnt, 0) * 5 as social_priority
+                FROM accounts a
+                LEFT JOIN personas p ON a.id = p.account_id
+                LEFT JOIN (
+                    SELECT account_id, COUNT(*) as cnt
+                    FROM (
+                        SELECT initiator_account_id as account_id FROM private_conversations WHERE status = 'active'
+                        UNION ALL
+                        SELECT responder_account_id as account_id FROM private_conversations WHERE status = 'active'
+                    )
+                    GROUP BY account_id
+                ) active_conv ON a.id = active_conv.account_id
+                LEFT JOIN (
+                    SELECT account_id, COUNT(*) as cnt
+                    FROM (
+                        SELECT initiator_account_id as account_id FROM private_conversations
+                        UNION ALL
+                        SELECT responder_account_id as account_id FROM private_conversations
+                    )
+                    GROUP BY account_id
+                ) total_conv ON a.id = total_conv.account_id
+                WHERE a.is_active = 1
+                AND a.is_deleted = 0
+                AND a.is_frozen = 0
+                AND a.warmup_stage >= ?
+                AND a.can_initiate_dm = 1
+                AND a.account_type = 'warmup'
+                AND (a.is_banned = 0 OR (a.is_banned = 1 AND a.unban_date IS NOT NULL))
+                AND COALESCE(active_conv.cnt, 0) < ?
+                ORDER BY social_priority DESC, RANDOM()
+                LIMIT ?
+                """,
+                (min_stage, max_active_conversations, limit)
+            )
+            rows = cursor.fetchall()
+            accounts = []
+            for row in rows:
+                acc = dict(row)
+                if acc.get("interests"):
+                    try:
+                        acc["interests"] = json.loads(acc["interests"])
+                    except:
+                        pass
+                accounts.append(acc)
+            return accounts
+    except Exception as e:
+        logger.error(f"Error getting accounts for social activity: {e}")
+        return []
+
+
+def calculate_social_probability(total_connections: int, warmup_stage: int) -> float:
+    """
+    Calculate probability that an account should initiate new social activity.
+
+    More connections = lower probability
+    Higher stage = higher base probability
+
+    Args:
+        total_connections: Total number of conversations (active + ended)
+        warmup_stage: Account's warmup stage
+
+    Returns:
+        Probability between 0.0 and 1.0
+    """
+    # Base probability by stage
+    if warmup_stage < 5:
+        base = 0.3
+    elif warmup_stage < 10:
+        base = 0.5
+    else:
+        base = 0.7
+
+    # Reduce probability based on existing connections
+    # 0 connections: no reduction
+    # 5 connections: -25%
+    # 10+ connections: -50%
+    connection_penalty = min(0.5, total_connections * 0.05)
+
+    return max(0.1, base - connection_penalty)
+
+
 def get_potential_conversation_partners(
     initiator_session_id: str,
     limit: int = 10,
-    include_helpers: bool = True
+    include_helpers: bool = True,
+    prefer_helpers: bool = True
 ) -> List[Dict[str, Any]]:
     """
     Get potential partners for a new conversation.
 
     Includes both warmup and helper accounts.
+    When warmup initiates, PREFERS helpers as partners to build warmup-helper connections.
     Helpers (spamblock) can respond to DMs but can't initiate.
 
     Args:
         initiator_session_id: Session ID of the initiator
         limit: Maximum number of partners to return
         include_helpers: Whether to include helper accounts
+        prefer_helpers: If True, prioritize helpers over warmup (default True)
 
     Returns:
         List of account dicts with account_type field
@@ -2041,9 +2156,32 @@ def get_potential_conversation_partners(
             else:
                 ban_filter = "AND (a.is_banned = 0 OR (a.is_banned = 1 AND a.unban_date IS NOT NULL))"
 
+            # Priority order: helpers first (they need connections), then warmup
+            # Also consider accounts with fewer existing connections
+            if prefer_helpers:
+                # Helpers first (priority 0), warmup second (priority 1)
+                order_clause = """
+                ORDER BY
+                    CASE WHEN a.account_type = 'helper' THEN 0 ELSE 1 END,
+                    connection_count ASC,
+                    RANDOM()
+                """
+            else:
+                order_clause = """
+                ORDER BY
+                    CASE WHEN a.account_type = 'warmup' THEN 0 ELSE 1 END,
+                    a.warmup_stage DESC,
+                    RANDOM()
+                """
+
             cursor.execute(
                 f"""
-                SELECT a.*, p.generated_name, p.interests, p.communication_style
+                SELECT a.*, p.generated_name, p.interests, p.communication_style,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM private_conversations pc
+                         WHERE pc.initiator_account_id = a.id OR pc.responder_account_id = a.id),
+                        0
+                    ) as connection_count
                 FROM accounts a
                 LEFT JOIN personas p ON a.id = p.account_id
                 WHERE a.session_id != ?
@@ -2059,10 +2197,7 @@ def get_potential_conversation_partners(
                         OR (pc.responder_session_id = ? AND pc.initiator_session_id = a.session_id)
                     )
                 )
-                ORDER BY
-                    CASE WHEN a.account_type = 'warmup' THEN 0 ELSE 1 END,
-                    a.warmup_stage DESC,
-                    RANDOM()
+                {order_clause}
                 LIMIT ?
                 """,
                 (initiator_session_id, initiator_session_id, initiator_session_id, limit)

@@ -634,7 +634,11 @@ class GroupEngine:
         Find lonely accounts and create/join groups for them.
 
         Creator must be a warmup account.
-        Members can be both warmup and helper accounts.
+        Members should be predominantly helpers (warmup-helper connections preferred).
+
+        Group composition strategy:
+        - 70% chance: 1 warmup creator + mostly helpers (1-2 warmup max)
+        - 30% chance: 1 warmup creator + mix of warmup and helpers
 
         Returns:
             Number of new activities initiated
@@ -650,7 +654,7 @@ class GroupEngine:
         # Get accounts that need group membership (includes both warmup and helpers)
         lonely_accounts = get_accounts_without_group_membership(
             min_stage=MIN_STAGE_FOR_DM,
-            limit=15,  # Get more to have options
+            limit=25,  # Get more to have options
             include_helpers=True
         )
 
@@ -671,14 +675,31 @@ class GroupEngine:
             return 0
 
         creator = warmup_accounts[0]
+        remaining_warmup = warmup_accounts[1:]
 
-        # Members can be mix of warmup and helpers
-        # Prioritize warmup accounts, add helpers to fill remaining slots
-        potential_members = warmup_accounts[1:] + helper_accounts
-        initial_members = [
-            acc["session_id"]
-            for acc in potential_members[:self.max_members_per_group - 1]
-        ]
+        # Shuffle helpers for randomness
+        random.shuffle(helper_accounts)
+
+        # Decide group composition strategy
+        prefer_helpers = random.random() < 0.7  # 70% chance to prefer helpers
+
+        if prefer_helpers and len(helper_accounts) >= 2:
+            # Mostly helpers: 1-2 warmup + rest helpers
+            max_warmup_members = min(2, len(remaining_warmup))
+            warmup_to_add = remaining_warmup[:max_warmup_members]
+            slots_for_helpers = self.max_members_per_group - 1 - len(warmup_to_add)
+            helpers_to_add = helper_accounts[:slots_for_helpers]
+            potential_members = warmup_to_add + helpers_to_add
+        else:
+            # Mixed: helpers first, then fill with warmup
+            # This still prefers helpers but allows more warmup if needed
+            potential_members = helper_accounts + remaining_warmup
+            potential_members = potential_members[:self.max_members_per_group - 1]
+
+        # Shuffle to mix warmup and helpers randomly in the list
+        random.shuffle(potential_members)
+
+        initial_members = [acc["session_id"] for acc in potential_members]
 
         if len(initial_members) < self.min_members_per_group - 1:
             logger.debug(
@@ -691,11 +712,11 @@ class GroupEngine:
         group_type = random.choice(["friends", "thematic"])
 
         # Log member composition
-        warmup_count = sum(1 for a in potential_members[:self.max_members_per_group - 1]
-                          if a.get("account_type") == "warmup")
-        helper_count = len(initial_members) - warmup_count
+        warmup_count = sum(1 for a in potential_members if a.get("account_type") == "warmup")
+        helper_count = len(potential_members) - warmup_count
         logger.info(
-            f"Creating group: 1 creator + {warmup_count} warmup + {helper_count} helpers"
+            f"Creating group: 1 warmup creator + {warmup_count} warmup + {helper_count} helpers "
+            f"(prefer_helpers={prefer_helpers})"
         )
 
         result = await self.create_new_group(

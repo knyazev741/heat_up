@@ -9,3 +9,9 @@ pylogram==0.12.3
 
 duckduckgo_search
 beautifulsoup4
+
+# Dashboard
+nicegui>=2.0.0
+plotly>=5.18.0
+pyvis>=0.3.2
+bcrypt>=4.1.0

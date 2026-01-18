@@ -46,10 +46,15 @@ class Settings(BaseSettings):
     # Content randomization
     enable_content_randomization: bool = True
     message_variations_count: int = 10
-    
+
+    # Dashboard settings
+    dashboard_secret: str = "heat_up_dashboard_secret_change_me"
+    dashboard_password_hash: str = ""  # bcrypt hash, empty = default "admin"
+
     class Config:
         env_file = ".env"
         populate_by_name = True  # Allow both field name and alias
+        extra = "ignore"  # Ignore extra env vars
 
 
 settings = Settings()
