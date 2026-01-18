@@ -4,12 +4,11 @@ Settings page for system configuration and management.
 
 from nicegui import ui
 import os
-import httpx
 
 from dashboard.auth import is_authenticated, hash_password
 from dashboard.components.layout import page_layout, card
 from dashboard.components.cards import stat_row
-from dashboard.utils.queries import get_scheduler_status, cleanup_old_logs
+from dashboard.utils.queries import cleanup_old_logs
 
 
 def create_settings_page():
@@ -26,9 +25,19 @@ def create_settings_page():
                     def refresh_scheduler_status():
                         status_container.clear()
                         with status_container:
-                            status = get_scheduler_status()
+                            # Get scheduler status directly from Python
+                            try:
+                                from main import warmup_scheduler
+                                if warmup_scheduler:
+                                    status = warmup_scheduler.get_status()
+                                    is_running = status.get("is_running", False)
+                                else:
+                                    is_running = False
+                                    status = {}
+                            except Exception as e:
+                                is_running = False
+                                status = {"error": str(e)}
 
-                            is_running = status.get("running", False)
                             status_text = "Запущен" if is_running else "Остановлен"
                             status_color = "green" if is_running else "red"
 
@@ -36,12 +45,16 @@ def create_settings_page():
                                 ui.icon("circle").classes(f"text-{status_color}-500 text-sm")
                                 ui.label(status_text).classes(f"text-{status_color}-400 font-medium")
 
-                            if "next_check" in status:
-                                stat_row("Следующая проверка", status["next_check"])
-                            if "active_warmups" in status:
-                                stat_row("Активных прогревов", status["active_warmups"])
-                            if "helper_accounts" in status:
+                            if status.get("next_check_in"):
+                                stat_row("Следующая проверка", f"{status['next_check_in'] // 60} мин")
+                            if status.get("accounts_scheduled"):
+                                stat_row("Активных прогревов", status["accounts_scheduled"])
+                            if status.get("helper_accounts"):
                                 stat_row("Helper аккаунтов", status["helper_accounts"])
+                            if status.get("active_conversations") is not None:
+                                stat_row("Активных диалогов", status["active_conversations"])
+                            if status.get("active_groups") is not None:
+                                stat_row("Активных групп", status["active_groups"])
                             if "error" in status:
                                 ui.label(f"Ошибка: {status['error']}").classes("text-red-400 text-sm mt-2")
 
@@ -49,16 +62,15 @@ def create_settings_page():
                             with ui.row().classes("gap-2 mt-4"):
                                 async def scheduler_action(action: str):
                                     try:
-                                        response = httpx.post(
-                                            f"http://localhost:8080/scheduler/{action}",
-                                            timeout=10.0
-                                        )
-                                        if response.status_code == 200:
-                                            ui.notify(f"Scheduler {action} успешно", type="positive")
-                                        else:
-                                            ui.notify(f"Ошибка: {response.text}", type="negative")
+                                        from main import warmup_scheduler
+                                        if action == "start":
+                                            await warmup_scheduler.start()
+                                            ui.notify("Scheduler запущен", type="positive")
+                                        elif action == "stop":
+                                            await warmup_scheduler.stop()
+                                            ui.notify("Scheduler остановлен", type="positive")
                                     except Exception as e:
-                                        ui.notify(f"Ошибка подключения: {e}", type="negative")
+                                        ui.notify(f"Ошибка: {e}", type="negative")
                                     refresh_scheduler_status()
 
                                 ui.button(
@@ -82,28 +94,38 @@ def create_settings_page():
                     refresh_scheduler_status()
 
                 # Main API status
-                with card("Основной API").classes("w-full"):
+                with card("Компоненты системы").classes("w-full"):
                     api_container = ui.column().classes("w-full")
 
                     def check_api():
                         api_container.clear()
                         with api_container:
                             try:
-                                response = httpx.get("http://localhost:8080/health", timeout=5.0)
-                                if response.status_code == 200:
-                                    data = response.json()
-                                    with ui.row().classes("items-center gap-2"):
-                                        ui.icon("check_circle").classes("text-green-500")
-                                        ui.label("API работает").classes("text-green-400")
+                                from main import telegram_client, llm_agent, warmup_scheduler
 
-                                    stat_row("URL", "http://localhost:8080")
-                                    stat_row("Статус", data.get("status", "ok"))
-                                else:
-                                    ui.label(f"Ошибка: HTTP {response.status_code}").classes("text-red-400")
+                                # Check components
+                                tg_ok = telegram_client is not None
+                                llm_ok = llm_agent is not None
+                                scheduler_ok = warmup_scheduler is not None
+
+                                all_ok = tg_ok and llm_ok and scheduler_ok
+
+                                with ui.row().classes("items-center gap-2 mb-2"):
+                                    if all_ok:
+                                        ui.icon("check_circle").classes("text-green-500")
+                                        ui.label("Все компоненты работают").classes("text-green-400")
+                                    else:
+                                        ui.icon("warning").classes("text-yellow-500")
+                                        ui.label("Некоторые компоненты недоступны").classes("text-yellow-400")
+
+                                stat_row("Telegram Client", "✓" if tg_ok else "✗")
+                                stat_row("LLM Agent", "✓" if llm_ok else "✗")
+                                stat_row("Scheduler", "✓" if scheduler_ok else "✗")
+
                             except Exception as e:
                                 with ui.row().classes("items-center gap-2"):
                                     ui.icon("error").classes("text-red-500")
-                                    ui.label("API недоступен").classes("text-red-400")
+                                    ui.label("Ошибка проверки").classes("text-red-400")
                                 ui.label(str(e)).classes("text-slate-400 text-sm")
 
                     check_api()

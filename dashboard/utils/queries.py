@@ -875,8 +875,17 @@ def get_scheduler_status() -> Dict[str, Any]:
     try:
         response = httpx.get("http://localhost:8080/scheduler/status", timeout=5.0)
         if response.status_code == 200:
-            return response.json()
-    except Exception:
+            data = response.json()
+            # Map API response to dashboard format
+            return {
+                "running": data.get("is_running", False),
+                "next_check": f"{data.get('next_check_in', 0) // 60} мин" if data.get("next_check_in") else None,
+                "active_warmups": data.get("accounts_scheduled", 0),
+                "helper_accounts": data.get("helper_accounts", 0),
+                "active_conversations": data.get("active_conversations", 0),
+                "active_groups": data.get("active_groups", 0),
+            }
+    except Exception as e:
         pass
     return {"running": False, "error": "Unable to connect"}
 

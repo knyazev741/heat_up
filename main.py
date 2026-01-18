@@ -1100,8 +1100,8 @@ async def stop_scheduler_endpoint(token_info: dict = Depends(verify_api_token)):
 
 
 @app.get("/scheduler/status")
-async def get_scheduler_status_endpoint(token_info: dict = Depends(verify_api_token)):
-    """Get scheduler status"""
+async def get_scheduler_status_endpoint():
+    """Get scheduler status (public endpoint for dashboard)"""
     try:
         status = warmup_scheduler.get_status()
         return status
