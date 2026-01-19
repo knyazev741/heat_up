@@ -5,6 +5,7 @@ from Admin API and add them to warmup.
 """
 
 import asyncio
+import json
 import sys
 import os
 
@@ -198,8 +199,8 @@ async def main():
                             persona_data.get('occupation', ''),
                             persona_data.get('city', ''),
                             persona_data.get('country', country_normalized),
-                            persona_data.get('personality_traits', ''),
-                            persona_data.get('interests', ''),
+                            json.dumps(persona_data.get('personality_traits', [])),
+                            json.dumps(persona_data.get('interests', [])),
                             persona_data.get('communication_style', ''),
                             persona_data.get('emoji_usage', 'moderate'),
                             persona_data.get('typical_online_hours', ''),

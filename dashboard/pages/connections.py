@@ -127,8 +127,12 @@ def generate_graph_html(
     }
     """)
 
-    # Color mapping by stage
-    def get_node_color(stage):
+    # Color mapping by stage (for warmup) or type (for helper)
+    def get_node_color(stage, account_type):
+        # Helpers get distinct orange color
+        if account_type == "helper":
+            return "#f97316"  # orange
+        # Warmup accounts colored by stage
         if stage is None:
             return "#6b7280"  # gray
         elif stage <= 3:
@@ -144,7 +148,8 @@ def generate_graph_html(
     for node in nodes:
         node_id = node["id"]
         stage = node.get("stage", 1)
-        color = get_node_color(stage)
+        account_type = node.get("type", "warmup")
+        color = get_node_color(stage, account_type)
 
         # Highlight selected node
         if highlight_account and node_id == highlight_account:
@@ -382,6 +387,14 @@ def create_connections_page():
 
         # Legend
         with ui.row().classes("w-full gap-6 mb-4"):
+            # Helper accounts
+            with ui.row().classes("items-center gap-2"):
+                ui.element("div").classes("w-4 h-4 rounded-full bg-orange-500")
+                ui.label("Helper").classes("text-slate-400 text-sm font-medium")
+
+            ui.label("|").classes("text-slate-600")
+
+            # Warmup by stage
             with ui.row().classes("items-center gap-2"):
                 ui.element("div").classes("w-4 h-4 rounded-full bg-green-500")
                 ui.label("Stage 1-3").classes("text-slate-400 text-sm")

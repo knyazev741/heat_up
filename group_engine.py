@@ -406,6 +406,14 @@ class GroupEngine:
             update_bot_group(group_id, next_activity_after=next_activity)
             return False
 
+        # Small chance to include a link in bot group messages (10%)
+        if random.random() < 0.10:
+            message_text = self._maybe_add_link_to_message(
+                message_text,
+                group.get("topic", ""),
+                sender_persona
+            )
+
         # Send message via Telegram (use raw TL for groups)
         send_result = await self.telegram.send_message_to_group(
             session_id=sender_session_id,
@@ -608,6 +616,138 @@ class GroupEngine:
             next_activity_after=None
         )
         logger.info(f"Archived group {group_id}: '{group.get('group_title')}'")
+
+    def _maybe_add_link_to_message(
+        self,
+        message_text: str,
+        topic: str,
+        sender_persona: Dict[str, Any]
+    ) -> str:
+        """
+        Add a link to the message with some probability.
+        Uses popular, well-known resources.
+
+        Args:
+            message_text: Original message
+            topic: Group topic
+            sender_persona: Persona of sender (for interests)
+
+        Returns:
+            Message with link added
+        """
+        # Popular links by category (well-known resources)
+        links_by_category = {
+            "music": [
+                "https://open.spotify.com",
+                "https://music.youtube.com",
+                "https://soundcloud.com",
+                "https://music.apple.com",
+            ],
+            "video": [
+                "https://youtube.com",
+                "https://vimeo.com",
+                "https://twitch.tv",
+            ],
+            "news": [
+                "https://bbc.com",
+                "https://reuters.com",
+                "https://theguardian.com",
+                "https://nytimes.com",
+            ],
+            "tech": [
+                "https://github.com",
+                "https://stackoverflow.com",
+                "https://medium.com",
+                "https://dev.to",
+                "https://hackernews.com",
+            ],
+            "learning": [
+                "https://coursera.org",
+                "https://udemy.com",
+                "https://edx.org",
+                "https://khanacademy.org",
+            ],
+            "social": [
+                "https://reddit.com",
+                "https://twitter.com",
+                "https://instagram.com",
+                "https://pinterest.com",
+            ],
+            "travel": [
+                "https://booking.com",
+                "https://airbnb.com",
+                "https://tripadvisor.com",
+                "https://google.com/maps",
+            ],
+            "shopping": [
+                "https://amazon.com",
+                "https://ebay.com",
+                "https://aliexpress.com",
+            ],
+            "food": [
+                "https://yelp.com",
+                "https://allrecipes.com",
+                "https://foodnetwork.com",
+            ],
+            "sports": [
+                "https://espn.com",
+                "https://fifa.com",
+                "https://nba.com",
+            ],
+            "games": [
+                "https://steam.com",
+                "https://twitch.tv",
+                "https://epicgames.com",
+            ],
+            "general": [
+                "https://wikipedia.org",
+                "https://google.com",
+                "https://youtube.com",
+                "https://reddit.com",
+            ],
+        }
+
+        # Determine category based on topic and persona interests
+        topic_lower = topic.lower()
+        interests = sender_persona.get("interests", [])
+        interests_lower = [i.lower() for i in interests] if interests else []
+
+        # Map keywords to categories
+        category = "general"
+        keyword_map = {
+            "music": ["музык", "песн", "концерт", "music"],
+            "video": ["фильм", "кино", "видео", "сериал", "movie", "video"],
+            "tech": ["технолог", "программ", "код", "tech", "it", "компьютер"],
+            "learning": ["учеб", "курс", "образован", "learn"],
+            "travel": ["путешеств", "туризм", "travel", "город"],
+            "food": ["еда", "кулинар", "рецепт", "готов", "food", "cook"],
+            "sports": ["спорт", "фитнес", "футбол", "sport", "fitness"],
+            "games": ["игр", "game", "геймер"],
+            "news": ["новост", "news", "политик"],
+        }
+
+        for cat, keywords in keyword_map.items():
+            for kw in keywords:
+                if kw in topic_lower or any(kw in i for i in interests_lower):
+                    category = cat
+                    break
+            if category != "general":
+                break
+
+        # Select random link from category
+        link = random.choice(links_by_category.get(category, links_by_category["general"]))
+
+        # Natural ways to add link
+        link_intros = [
+            f"\n\nКстати, вот интересное: {link}",
+            f"\n\nНашел тут: {link}",
+            f"\n\nСмотрите что нашел: {link}",
+            f"\n\nВот ссылка: {link}",
+            f"\n\n{link} — глянь",
+            f"\n\nПо теме: {link}",
+        ]
+
+        return message_text + random.choice(link_intros)
 
     def _generate_group_title(self, topic: str, group_type: str) -> str:
         """Generate a natural group title"""
