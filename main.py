@@ -101,12 +101,12 @@ async def lifespan(app: FastAPI):
     # Start background cleanup task
     cleanup_task_handle = asyncio.create_task(cleanup_task())
     
-    # Auto-start scheduler if enabled
+    # Auto-start scheduler if enabled (run in background to not block startup)
     if settings.scheduler_enabled:
-        logger.info("Auto-starting warmup scheduler...")
-        await warmup_scheduler.start()
-    
-    logger.info("Service ready")
+        logger.info("Auto-starting warmup scheduler in background...")
+        asyncio.create_task(warmup_scheduler.start())
+
+    logger.info("Service ready - API accepting requests")
     
     yield
     
@@ -1301,7 +1301,7 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8080,
-        reload=True,
+        reload=False,  # Disabled in production to prevent watchfiles issues
         log_level=settings.log_level.lower()
     )
 
