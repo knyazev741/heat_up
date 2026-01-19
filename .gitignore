@@ -61,3 +61,9 @@ sessions.db
 response_*.json
 test_integration.py
 
+# NiceGUI cache
+.nicegui/
+
+# API tokens (secrets)
+data/api_tokens.json
+
