@@ -76,34 +76,49 @@ async def sync_session_statuses() -> Dict[str, Any]:
 
 
 async def _sync_frozen_sessions(client: AdminAPIClient) -> set:
-    """Sync frozen sessions"""
+    """Sync frozen sessions and record new freezes to journal"""
     logger.debug("Syncing frozen sessions...")
-    
+
+    # Get currently frozen sessions BEFORE resetting
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        cursor.execute("SELECT session_id FROM accounts WHERE is_frozen = 1")
+        previously_frozen = {row[0] for row in cursor.fetchall()}
+
+        # Reset all frozen flags
         cursor.execute("UPDATE accounts SET is_frozen = 0")
         conn.commit()
-    
+
     result = await client.get_sessions(frozen=True, limit=100)
     total = result.get('total', 0)
     frozen_ids = set()
-    
+    frozen_api_data = {}  # Store Admin API data for journal
+
     skip = 0
     limit = 100
-    
+
     while skip < total:
         result = await client.get_sessions(frozen=True, skip=skip, limit=limit)
         items = result.get('items', [])
-        
+
         if not items:
             break
-        
+
         for session in items:
             session_id = str(session.get('id'))
             frozen_ids.add(session_id)
-        
+            # Store API data for potential journal entry
+            frozen_api_data[session_id] = {
+                "phone_number": session.get('phone_number'),
+                "status": session.get('status'),
+                "frozen": session.get('frozen'),
+                "ban_date": session.get('ban_date'),
+                "country": session.get('country'),
+                "provider": session.get('provider')
+            }
+
         skip += limit
-    
+
     if frozen_ids:
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -113,7 +128,22 @@ async def _sync_frozen_sessions(client: AdminAPIClient) -> set:
                 list(frozen_ids)
             )
             conn.commit()
-    
+
+    # Record new freezes to journal
+    newly_frozen = frozen_ids - previously_frozen
+    if newly_frozen:
+        logger.warning(f"Detected {len(newly_frozen)} newly frozen accounts!")
+        try:
+            from freeze_journal import record_freeze_event
+            for session_id in newly_frozen:
+                record_freeze_event(
+                    session_id,
+                    freeze_source="admin_api_sync",
+                    admin_api_data=frozen_api_data.get(session_id)
+                )
+        except Exception as e:
+            logger.error(f"Error recording freeze events: {e}")
+
     return frozen_ids
 
 

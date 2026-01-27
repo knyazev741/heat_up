@@ -97,6 +97,27 @@ class ActionExecutor:
                     logger.error(f"❌ ACTION FAILED: {result['error']}")
                     logger.error(f"Result details: {json.dumps(result, indent=2, ensure_ascii=False)}")
 
+                    # Check for frozen session error
+                    if "frozen" in str(result["error"]).lower():
+                        logger.error(f"❄️ SESSION FROZEN: {session_id}")
+                        update_account(session_id, is_frozen=True)
+                        # Record to freeze journal
+                        try:
+                            from freeze_journal import record_freeze_event
+                            record_freeze_event(session_id, freeze_source="rpc_error")
+                        except Exception as je:
+                            logger.error(f"Failed to record freeze event: {je}")
+                        return {
+                            "session_id": session_id,
+                            "total_actions": len(actions),
+                            "executed": idx,
+                            "successful": idx - len(errors),
+                            "failed": len(errors),
+                            "results": results,
+                            "errors": errors,
+                            "session_frozen": True
+                        }
+
                     # Check for critical session errors (dead/revoked session)
                     critical_error = _is_critical_session_error(result["error"])
                     if critical_error:

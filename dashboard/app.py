@@ -26,6 +26,7 @@ from dashboard.pages.connections import create_connections_page
 from dashboard.pages.channels import create_channels_page
 from dashboard.pages.logs import create_logs_page
 from dashboard.pages.settings import create_settings_page
+from dashboard.pages.freeze_journal import create_freeze_journal_page
 from dashboard.auth import is_authenticated
 
 
@@ -92,6 +93,14 @@ def setup_routes():
             ui.navigate.to("/dashboard/login")
             return
         create_settings_page()
+
+    @ui.page("/freeze-journal")
+    def freeze_journal_page():
+        """Freeze journal page."""
+        if not is_authenticated():
+            ui.navigate.to("/dashboard/login")
+            return
+        create_freeze_journal_page()
 
 
 def init_dashboard(fastapi_app, storage_secret: str = None):
@@ -189,6 +198,13 @@ def setup_standalone_routes():
             ui.navigate.to("/login")
             return
         create_settings_page()
+
+    @ui.page("/freeze-journal")
+    def freeze_journal_page():
+        if not is_authenticated():
+            ui.navigate.to("/login")
+            return
+        create_freeze_journal_page()
 
 
 if __name__ in {"__main__", "__mp_main__"}:

@@ -33,6 +33,7 @@ def get_nav_items():
         {"path": f"{base}/connections", "icon": "hub", "label": "Связи"},
         {"path": f"{base}/channels", "icon": "forum", "label": "Каналы"},
         {"path": f"{base}/logs", "icon": "history", "label": "Логи"},
+        {"path": f"{base}/freeze-journal", "icon": "ac_unit", "label": "Заморозки"},
         {"path": f"{base}/settings", "icon": "settings", "label": "Настройки"},
     ]
 
