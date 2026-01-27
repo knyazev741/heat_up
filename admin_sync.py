@@ -129,20 +129,33 @@ async def _sync_frozen_sessions(client: AdminAPIClient) -> set:
             )
             conn.commit()
 
-    # Record new freezes to journal
+    # Record new freezes to journal (only warmup accounts)
     newly_frozen = frozen_ids - previously_frozen
     if newly_frozen:
-        logger.warning(f"Detected {len(newly_frozen)} newly frozen accounts!")
-        try:
-            from freeze_journal import record_freeze_event
-            for session_id in newly_frozen:
-                record_freeze_event(
-                    session_id,
-                    freeze_source="admin_api_sync",
-                    admin_api_data=frozen_api_data.get(session_id)
-                )
-        except Exception as e:
-            logger.error(f"Error recording freeze events: {e}")
+        # Filter to only warmup accounts with warmup history
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            placeholders = ','.join(['?' for _ in newly_frozen])
+            cursor.execute(
+                f"""SELECT session_id FROM accounts
+                    WHERE session_id IN ({placeholders})
+                    AND account_type = 'warmup' AND total_warmups > 0""",
+                list(newly_frozen)
+            )
+            warmup_frozen = {row[0] for row in cursor.fetchall()}
+
+        if warmup_frozen:
+            logger.warning(f"Detected {len(warmup_frozen)} newly frozen WARMUP accounts!")
+            try:
+                from freeze_journal import record_freeze_event
+                for session_id in warmup_frozen:
+                    record_freeze_event(
+                        session_id,
+                        freeze_source="admin_api_sync",
+                        admin_api_data=frozen_api_data.get(session_id)
+                    )
+            except Exception as e:
+                logger.error(f"Error recording freeze events: {e}")
 
     return frozen_ids
 

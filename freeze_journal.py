@@ -308,16 +308,17 @@ def get_freeze_journal_count(session_id: Optional[str] = None) -> int:
 
 def record_existing_frozen_accounts():
     """
-    Record journal entries for all currently frozen accounts.
+    Record journal entries for frozen WARMUP accounts only.
     Useful for backfilling historical data.
     """
-    logger.info("Recording journal entries for existing frozen accounts...")
+    logger.info("Recording journal entries for existing frozen warmup accounts...")
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT session_id FROM accounts
-            WHERE is_frozen = 1 AND is_deleted = 0 AND total_warmups > 0
+            WHERE is_frozen = 1 AND is_deleted = 0
+            AND total_warmups > 0 AND account_type = 'warmup'
         """)
 
         frozen_sessions = [row[0] for row in cursor.fetchall()]
