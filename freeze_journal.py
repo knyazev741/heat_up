@@ -137,22 +137,25 @@ def record_freeze_event(
     # Get action stats
     action_stats = get_action_stats(session_id)
 
-    # Determine freeze date
-    # Priority: explicit freeze_date > admin_api ban_date > last_warmup_date > now
+    # Determine dates
+    # freeze_detected_at = when WE detected the freeze (last warmup or now)
+    # ban_date = when Telegram banned (from Admin API)
     if freeze_date:
         detected_at = freeze_date
-    elif admin_api_data and admin_api_data.get("ban_date"):
-        detected_at = admin_api_data["ban_date"]
     elif account_info.get("last_warmup_date"):
         detected_at = account_info["last_warmup_date"]
     else:
         detected_at = datetime.utcnow().isoformat()
+
+    # Extract ban_date separately
+    ban_date = admin_api_data.get("ban_date") if admin_api_data else None
 
     # Create journal entry
     entry = {
         "id": f"{session_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
         "session_id": session_id,
         "freeze_detected_at": detected_at,
+        "telegram_ban_date": ban_date,
         "freeze_source": freeze_source,
         "account_info": account_info,
         "admin_api_data": admin_api_data,
