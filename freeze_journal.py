@@ -108,7 +108,8 @@ def get_action_stats(session_id: str) -> Dict[str, int]:
 def record_freeze_event(
     session_id: str,
     freeze_source: str = "admin_api_sync",
-    admin_api_data: Optional[Dict[str, Any]] = None
+    admin_api_data: Optional[Dict[str, Any]] = None,
+    freeze_date: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Record a freeze event to the journal.
@@ -117,6 +118,7 @@ def record_freeze_event(
         session_id: The frozen session ID
         freeze_source: Where the freeze was detected (admin_api_sync, rpc_error, etc.)
         admin_api_data: Optional data from Admin API about the session
+        freeze_date: Optional explicit freeze date (for historical backfill)
 
     Returns:
         The recorded journal entry
@@ -135,11 +137,22 @@ def record_freeze_event(
     # Get action stats
     action_stats = get_action_stats(session_id)
 
+    # Determine freeze date
+    # Priority: explicit freeze_date > admin_api ban_date > last_warmup_date > now
+    if freeze_date:
+        detected_at = freeze_date
+    elif admin_api_data and admin_api_data.get("ban_date"):
+        detected_at = admin_api_data["ban_date"]
+    elif account_info.get("last_warmup_date"):
+        detected_at = account_info["last_warmup_date"]
+    else:
+        detected_at = datetime.utcnow().isoformat()
+
     # Create journal entry
     entry = {
         "id": f"{session_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
         "session_id": session_id,
-        "freeze_detected_at": datetime.utcnow().isoformat(),
+        "freeze_detected_at": detected_at,
         "freeze_source": freeze_source,
         "account_info": account_info,
         "admin_api_data": admin_api_data,
@@ -309,8 +322,10 @@ def get_freeze_journal_count(session_id: Optional[str] = None) -> int:
 def record_existing_frozen_accounts():
     """
     Record journal entries for frozen WARMUP accounts only.
-    Useful for backfilling historical data.
+    Fetches ban_date from Admin API for accurate freeze dates.
     """
+    import asyncio
+
     logger.info("Recording journal entries for existing frozen warmup accounts...")
 
     with get_db_connection() as conn:
@@ -323,11 +338,45 @@ def record_existing_frozen_accounts():
 
         frozen_sessions = [row[0] for row in cursor.fetchall()]
 
+    # Fetch Admin API data for all frozen sessions
+    async def fetch_admin_data():
+        from admin_api_client import AdminAPIClient
+        client = AdminAPIClient()
+        admin_data = {}
+        try:
+            for session_id in frozen_sessions:
+                try:
+                    data = await client.get_session_by_id(int(session_id))
+                    if data:
+                        admin_data[session_id] = {
+                            "phone_number": data.get('phone_number'),
+                            "status": data.get('status'),
+                            "frozen": data.get('frozen'),
+                            "ban_date": data.get('ban_date'),
+                            "country": data.get('country'),
+                            "provider": data.get('provider')
+                        }
+                except Exception as e:
+                    logger.warning(f"Could not fetch Admin API data for {session_id}: {e}")
+        finally:
+            await client.close()
+        return admin_data
+
+    # Run async fetch
+    try:
+        admin_data = asyncio.run(fetch_admin_data())
+    except RuntimeError:
+        # Already in async context
+        loop = asyncio.get_event_loop()
+        admin_data = loop.run_until_complete(fetch_admin_data())
+
     recorded = 0
     for session_id in frozen_sessions:
+        api_data = admin_data.get(session_id)
         entry = record_freeze_event(
             session_id,
-            freeze_source="historical_backfill"
+            freeze_source="historical_backfill",
+            admin_api_data=api_data
         )
         if entry:
             recorded += 1
