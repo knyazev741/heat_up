@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 from datetime import datetime
 from openai import OpenAI
 from config import settings, CHANNEL_POOL, BOTS_POOL, WARMUP_GUIDELINES, RED_FLAGS, GREEN_FLAGS
-from database import get_session_summary, get_session_history, get_account, get_persona, get_relevant_chats, get_pending_incoming_dms, get_chats_for_participation
+from database import get_session_summary, get_session_history, get_account, get_persona, get_relevant_chats, get_pending_incoming_dms, get_behavioral_profile, DEFAULT_BEHAVIORAL_PROFILE
 
 logger = logging.getLogger(__name__)
 
@@ -126,35 +126,8 @@ class ActionPlannerAgent:
 """
             logger.info(f"📬 Found {len(pending_dms)} pending incoming DMs for {session_id}")
 
-        # Get groups where account can participate (Phase 2)
+        # Phase 2 reply_in_chat disabled - too risky for public chats
         participation_groups_context = ""
-        if account_id and warmup_stage >= 8:
-            participation_groups = get_chats_for_participation(
-                account_id=account_id,
-                min_relevance=0.6,
-                limit=5
-            )
-            if participation_groups:
-                group_lines = []
-                for grp in participation_groups:
-                    sent_today = grp.get('messages_sent_today', 0) or 0
-                    limit = grp.get('daily_message_limit', 3) or 3
-                    remaining = max(0, limit - sent_today)
-                    group_lines.append(
-                        f"- {grp.get('chat_username')}: {grp.get('chat_title', 'Unknown')} "
-                        f"(релевантность: {grp.get('relevance_score', 0):.1f}) "
-                        f"[осталось {remaining} сообщ. сегодня]"
-                    )
-                participation_groups_context = f"""
-💬 ГРУППЫ ДЛЯ АКТИВНОГО УЧАСТИЯ:
-Ты можешь написать сообщение в эти группы! Система автоматически проанализирует контекст и сгенерирует естественный ответ.
-
-{chr(10).join(group_lines)}
-
-Чтобы написать в группу, используй действие reply_in_chat с chat_username.
-ВАЖНО: Не злоупотребляй - пиши только если тема действительно тебе интересна.
-"""
-                logger.info(f"💬 Found {len(participation_groups)} groups for participation")
 
         # Build persona context
         if persona_data:
@@ -339,28 +312,42 @@ class ActionPlannerAgent:
             reason = "уже обновлен" if has_updated_profile else "новый аккаунт" if is_brand_new else f"stage {warmup_stage}<3" if warmup_stage < 3 else "не выпало по вероятности"
             logger.info(f"🚫 update_profile ОТКЛЮЧЕН для {session_id} ({reason})")
         
+        # Load behavioral profile for personalized examples
+        account_id = account_data.get("id") if account_data else None
+        bp = get_behavioral_profile(account_id) if account_id else DEFAULT_BEHAVIORAL_PROFILE
+        bp_read = bp.get("reading", {})
+        bp_timing = bp.get("timing", {})
+
+        # Calculate example durations from profile
+        read_example_dur = int(bp_read.get("max_read_time", 5) * 3)  # ~3x max read time
+        idle_example_dur = int(bp_timing.get("min_action_delay", 3) + bp_timing.get("max_action_delay", 10)) // 2
+        view_example_dur = int(bp_read.get("max_read_time", 5))
+
         # Остальные действия - всегда доступны
         actions_list.append(f"""
 {action_num}. join_channel (join_chat):
    {{"action": "join_channel", "channel_username": "@example", "reason": "Интересная тематика"}}""")
         action_num += 1
-        
+
         actions_list.append(f"""
 {action_num}. read_messages:
-   {{"action": "read_messages", "channel_username": "@example", "duration_seconds": 15, "reason": "Читаю контент"}}""")
+   {{"action": "read_messages", "channel_username": "@example", "duration_seconds": {read_example_dur}, "reason": "Читаю контент"}}""")
         action_num += 1
-        
+
         actions_list.append(f"""
 {action_num}. idle:
-   {{"action": "idle", "duration_seconds": 7, "reason": "Короткая пауза"}}""")
+   {{"action": "idle", "duration_seconds": {idle_example_dur}, "reason": "Короткая пауза"}}""")
         action_num += 1
-        
+
         actions_list.append(f"""
 {action_num}. view_profile:
-   {{"action": "view_profile", "channel_username": "@example", "duration_seconds": 5, "reason": "Изучаю чат/канал"}}""")
-        
+   {{"action": "view_profile", "channel_username": "@example", "duration_seconds": {view_example_dur}, "reason": "Изучаю чат/канал"}}""")
+
         basic_actions = "\n".join(actions_list)
-        
+
+        # Build behavioral hints from profile
+        behavioral_hints = self._build_behavioral_hints(bp)
+
         # Формируем полный return с динамическим списком действий
         return f"""{persona_context}
 
@@ -370,6 +357,7 @@ class ActionPlannerAgent:
 {history_context}
 {pending_dms_context}
 {participation_groups_context}
+{behavioral_hints}
 
 Твоя задача - сгенерировать реалистичную последовательность действий, которые ты бы совершил в Telegram СЕГОДНЯ.
 
@@ -410,25 +398,17 @@ class ActionPlannerAgent:
    - Используй если есть непрочитанные сообщения в ЛС (см. выше)
    - Пример: {{"action": "reply_to_dm", "conversation_id": 123, "message": "Привет! Да, интересная тема..."}}
 
-9. "reply_in_chat" - Ответить на сообщение в публичной группе
-   - Params: chat_username (обязательно), reply_text (опционально - будет сгенерирован автоматически)
-   - Доступно со стадии 8+
-   - ТОЛЬКО для ГРУПП (не каналов!) с меткой [ВСТУПИЛ ✅]
-   - Система автоматически проанализирует контекст и сгенерирует естественный ответ
-   - Дневной лимит: 3 сообщения на группу
-   - Пример: {{"action": "reply_in_chat", "chat_username": "@example_group", "reason": "Тема близка моим интересам"}}
-
-10. "sync_contacts" - Синхронизировать контакты
+9. "sync_contacts" - Синхронизировать контакты
     - Доступно со стадии 4+
 
-11. "update_privacy" - Настроить приватность
+10. "update_privacy" - Настроить приватность
     - Доступно со стадии 3+
 
-12. "create_group" - Создать группу
+11. "create_group" - Создать группу
     - Params: group_name
     - Доступно со стадии 10+
 
-13. "forward_message" - Переслать сообщение
+12. "forward_message" - Переслать сообщение
     - Params: from_chat, to_chat
     - Доступно со стадии 12+
 
@@ -457,6 +437,36 @@ class ActionPlannerAgent:
 
 Стадия: {warmup_stage}
 Формат ответа - ТОЛЬКО JSON массив, без текста!"""
+
+    def _build_behavioral_hints(self, bp: Dict[str, Any]) -> str:
+        """Build behavioral hints section for prompt based on behavioral profile"""
+        hints = []
+        eng = bp.get("engagement", {})
+        timing = bp.get("timing", {})
+
+        react_prob = eng.get("react_probability", 0.10)
+        if react_prob > 0.15:
+            hints.append("Ты любишь ставить реакции на интересные сообщения")
+        elif react_prob < 0.05:
+            hints.append("Ты редко ставишь реакции, предпочитаешь просто читать")
+
+        skip_prob = eng.get("skip_probability", 0.15)
+        if skip_prob < 0.08:
+            hints.append("Ты внимательно читаешь каждое сообщение")
+        elif skip_prob > 0.20:
+            hints.append("Ты часто пролистываешь сообщения, читая только самое интересное")
+
+        min_delay = timing.get("min_action_delay", 3)
+        if min_delay > 5:
+            hints.append("Ты неторопливый пользователь, делаешь паузы между действиями")
+        elif min_delay < 3:
+            hints.append("Ты активный пользователь, быстро переключаешься между действиями")
+
+        if not hints:
+            return ""
+
+        hints_text = "\n".join(f"- {h}" for h in hints)
+        return f"\n🎭 ТВОИ ПОВЕДЕНЧЕСКИЕ ОСОБЕННОСТИ:\n{hints_text}"
 
     async def generate_action_plan(self, session_id: str, account_data: Dict[str, Any] = None, persona_data: Dict[str, Any] = None) -> List[Dict[str, Any]]:
         """
@@ -492,10 +502,16 @@ class ActionPlannerAgent:
             logger.info(f"USER PROMPT:\n{user_prompt}")
             logger.info("=" * 100)
             
+            # Get temperature from behavioral profile
+            account_id = account_data.get("id") if account_data else None
+            bp = get_behavioral_profile(account_id) if account_id else DEFAULT_BEHAVIORAL_PROFILE
+            temp_offset = bp.get("llm", {}).get("temperature_offset", -0.05)
+            temperature = max(0.7, min(1.2, 1.0 + temp_offset))
+
             response = self.client.chat.completions.create(
                 model=self.model,
                 max_tokens=2048,
-                temperature=1.0,  # High temperature for diversity
+                temperature=temperature,
                 messages=[
                     {
                         "role": "system",
@@ -564,7 +580,7 @@ class ActionPlannerAgent:
         valid_actions = {
             "update_profile", "join_channel", "read_messages", "idle",
             "react_to_message", "message_bot", "view_profile",
-            "reply_in_chat", "sync_contacts", "update_privacy",
+            "sync_contacts", "update_privacy",
             "create_group", "forward_message", "reply_to_dm"
         }
 
@@ -666,15 +682,9 @@ class ActionPlannerAgent:
                     validated.append(action)
 
             elif action_type == "reply_in_chat":
-                # Phase 2: reply_in_chat only requires chat_username
-                # reply_text is optional - will be generated by context analyzer
-                username = action.get("chat_username") or action.get("channel_username")
-                if username:
-                    action["chat_username"] = username
-                    # Sanitize reply_text if provided
-                    if action.get("reply_text"):
-                        action["reply_text"] = action["reply_text"][:500]
-                    validated.append(action)
+                # DISABLED: reply_in_chat for public chats is too risky
+                logger.info(f"🚫 reply_in_chat DISABLED - skipping action for public chat")
+                continue
 
         # Ensure we have at least some actions
         if len(validated) < 3:

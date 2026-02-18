@@ -19,6 +19,11 @@ from persona_agent import PersonaAgent
 from search_agent import SearchAgent
 from admin_api_client import AdminAPIClient
 from auth import verify_api_token
+from safety_switch import (
+    is_warmup_actions_paused,
+    get_warmup_actions_switch_state,
+    set_warmup_actions_paused,
+)
 from models import (
     AddAccountRequest, UpdateAccountRequest, AccountResponse, 
     AccountDetailResponse, WarmupNowRequest, StatisticsResponse,
@@ -103,8 +108,11 @@ async def lifespan(app: FastAPI):
     
     # Auto-start scheduler if enabled (run in background to not block startup)
     if settings.scheduler_enabled:
-        logger.info("Auto-starting warmup scheduler in background...")
-        asyncio.create_task(warmup_scheduler.start())
+        if is_warmup_actions_paused():
+            logger.warning("Warmup actions are paused by safety switch. Scheduler auto-start skipped.")
+        else:
+            logger.info("Auto-starting warmup scheduler in background...")
+            asyncio.create_task(warmup_scheduler.start())
 
     logger.info("Service ready - API accepting requests")
     
@@ -163,6 +171,12 @@ class WarmupRequest(BaseModel):
     telegram_api_key: Optional[str] = None
 
 
+class WarmupActionsSwitchRequest(BaseModel):
+    """Request model for warmup actions safety switch"""
+    paused: bool
+    reason: Optional[str] = None
+
+
 @app.get("/")
 async def root():
     """Health check endpoint"""
@@ -207,7 +221,13 @@ async def warmup_session(
     """
     if not session_id:
         raise HTTPException(status_code=400, detail="Invalid session_id")
-    
+
+    if is_warmup_actions_paused():
+        raise HTTPException(
+            status_code=503,
+            detail="Warmup actions are paused by safety switch"
+        )
+
     logger.info(f"Received warmup request for session: {session_id}")
     
     try:
@@ -317,7 +337,13 @@ async def warmup_session_sync(
     """
     if not session_id:
         raise HTTPException(status_code=400, detail="Invalid session_id")
-    
+
+    if is_warmup_actions_paused():
+        raise HTTPException(
+            status_code=503,
+            detail="Warmup actions are paused by safety switch"
+        )
+
     logger.info(f"Received sync warmup request for session: {session_id}")
     
     try:
@@ -607,9 +633,10 @@ async def add_account_endpoint(
         logger.info("Step 4: Finding relevant chats...")
         discovered_chats = await search_agent.find_relevant_chats(
             persona=persona_data,
-            limit=settings.search_chats_per_persona
+            limit=settings.search_chats_per_persona,
+            account_id=account_id
         )
-        
+
         # 6. Save discovered chats
         logger.info(f"Step 5: Saving {len(discovered_chats)} discovered chats...")
         for chat in discovered_chats:
@@ -909,9 +936,10 @@ async def refresh_chats_endpoint(account_id: int, token_info: dict = Depends(ver
         
         new_chats = await search_agent.find_relevant_chats(
             persona,
-            limit=settings.search_chats_per_persona
+            limit=settings.search_chats_per_persona,
+            account_id=account_id
         )
-        
+
         for chat in new_chats:
             save_discovered_chat(account_id, chat)
         
@@ -941,6 +969,12 @@ async def warmup_account_now_endpoint(account_id: int, request: WarmupNowRequest
         Warmup result
     """
     try:
+        if is_warmup_actions_paused():
+            raise HTTPException(
+                status_code=503,
+                detail="Warmup actions are paused by safety switch"
+            )
+
         account = get_account_by_id(account_id)
         if not account:
             raise HTTPException(status_code=404, detail="Account not found")
@@ -1055,6 +1089,16 @@ async def delete_account_endpoint(account_id: int, token_info: dict = Depends(ve
 async def start_scheduler_endpoint(token_info: dict = Depends(verify_api_token)):
     """Start the warmup scheduler"""
     try:
+        if is_warmup_actions_paused():
+            return SuccessResponse(
+                success=False,
+                message="Warmup actions are paused by safety switch. Unpause first.",
+                data={
+                    "switch": get_warmup_actions_switch_state(),
+                    "scheduler": warmup_scheduler.get_status(),
+                }
+            )
+
         if warmup_scheduler.is_running:
             return SuccessResponse(
                 success=False,
@@ -1104,10 +1148,43 @@ async def get_scheduler_status_endpoint():
     """Get scheduler status (public endpoint for dashboard)"""
     try:
         status = warmup_scheduler.get_status()
+        status["warmup_actions_switch"] = get_warmup_actions_switch_state()
         return status
     except Exception as e:
         logger.error(f"Error getting scheduler status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/warmup-actions/status")
+async def get_warmup_actions_switch_endpoint():
+    """Get warmup actions safety switch status"""
+    return get_warmup_actions_switch_state()
+
+
+@app.post("/warmup-actions/switch")
+async def set_warmup_actions_switch_endpoint(
+    request: WarmupActionsSwitchRequest,
+    token_info: dict = Depends(verify_api_token)
+):
+    """Enable/disable all warmup actions globally"""
+    state = set_warmup_actions_paused(request.paused, request.reason or "")
+
+    scheduler_stopped = False
+    if request.paused and warmup_scheduler and warmup_scheduler.is_running:
+        await warmup_scheduler.stop()
+        scheduler_stopped = True
+
+    message = "Warmup actions paused" if request.paused else "Warmup actions resumed"
+
+    return SuccessResponse(
+        success=True,
+        message=message,
+        data={
+            "switch": state,
+            "scheduler_stopped": scheduler_stopped,
+            "scheduler_status": warmup_scheduler.get_status() if warmup_scheduler else None,
+        }
+    )
 
 
 # ========== STATISTICS AND MONITORING ==========
@@ -1189,9 +1266,10 @@ async def refresh_channels_endpoint(account_id: int, token_info: dict = Depends(
         # Запускаем поиск
         new_chats = await search_agent.find_relevant_chats(
             persona,
-            limit=settings.search_chats_per_persona
+            limit=settings.search_chats_per_persona,
+            account_id=account_id
         )
-        
+
         # Сохраняем в базу
         saved_count = 0
         for chat in new_chats:
@@ -1253,7 +1331,8 @@ async def refresh_all_low_channel_accounts_endpoint(token_info: dict = Depends(v
                     
                     new_chats = await search_agent.find_relevant_chats(
                         persona,
-                        limit=settings.search_chats_per_persona
+                        limit=settings.search_chats_per_persona,
+                        account_id=account_id
                     )
                     
                     saved_count = 0

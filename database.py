@@ -8,6 +8,7 @@ import sqlite3
 import json
 import logging
 import random
+import hashlib
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -257,9 +258,66 @@ def init_database():
             ON discovered_chats(account_id, chat_username)
         """)
 
+        # Index for chat exclusivity checks (warmup account isolation)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_discovered_chats_joined_username
+            ON discovered_chats(chat_username, is_joined)
+            WHERE is_joined = 1
+        """)
+
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_warmup_sessions_account
             ON warmup_sessions(account_id)
+        """)
+
+        # ========== SENT MESSAGES AUDIT TABLE ==========
+        # Stores all messages sent by accounts for:
+        # 1. Audit trail (what was sent and when)
+        # 2. Persona memory (remember what was said before)
+        # 3. Context for natural responses
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sent_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                chat_username TEXT NOT NULL,
+                message_text TEXT NOT NULL,
+                context_summary TEXT,
+                sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sent_messages_account_chat
+            ON sent_messages(account_id, chat_username)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sent_messages_sent_at
+            ON sent_messages(sent_at)
+        """)
+
+        # ========== SEARCH QUERIES HISTORY ==========
+        # Stores search queries used for finding chats
+        # Used to avoid repeating failed queries
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS search_queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                results_count INTEGER DEFAULT 0,
+                chats_found INTEGER DEFAULT 0,
+                chats_joined INTEGER DEFAULT 0,
+                searched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_search_queries_account
+            ON search_queries(account_id, searched_at)
         """)
 
         # ========== PHASE 1: PRIVATE CONVERSATIONS ==========
@@ -457,6 +515,34 @@ def init_database():
             ON bot_group_messages(group_id, sent_at)
         """)
 
+        # Pending group joins - for gradual member addition
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_group_joins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+
+                -- Scheduling
+                scheduled_at DATETIME NOT NULL,  -- When to attempt the join
+
+                -- State
+                status TEXT DEFAULT 'pending',  -- pending, completed, failed, cancelled
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                processed_at DATETIME,
+                error_message TEXT,
+
+                FOREIGN KEY (group_id) REFERENCES bot_groups(id),
+                FOREIGN KEY (account_id) REFERENCES accounts(id),
+                UNIQUE(group_id, account_id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_group_joins_scheduled
+            ON pending_group_joins(status, scheduled_at)
+        """)
+
         # =====================================================
         # Phase 2: Real group chat participation tables
         # =====================================================
@@ -523,6 +609,13 @@ def init_database():
             CREATE INDEX IF NOT EXISTS idx_real_chat_participation_account
             ON real_chat_participation(account_id, chat_username)
         """)
+
+        # Migration: Add behavioral_profile to personas
+        try:
+            cursor.execute("SELECT behavioral_profile FROM personas LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("Adding behavioral_profile column to personas table")
+            cursor.execute("ALTER TABLE personas ADD COLUMN behavioral_profile TEXT")
 
         conn.commit()
 
@@ -1075,6 +1168,12 @@ def save_persona(account_id: int, persona_data: Dict[str, Any]) -> Optional[int]
             )
             existing = cursor.fetchone()
             
+            # Serialize behavioral_profile if present
+            bp_json = None
+            if persona_data.get("behavioral_profile"):
+                bp = persona_data["behavioral_profile"]
+                bp_json = json.dumps(bp, ensure_ascii=False) if isinstance(bp, dict) else bp
+
             if existing:
                 # Update
                 cursor.execute(
@@ -1092,6 +1191,7 @@ def save_persona(account_id: int, persona_data: Dict[str, Any]) -> Optional[int]
                         activity_level = ?,
                         full_description = ?,
                         background_story = ?,
+                        behavioral_profile = COALESCE(?, behavioral_profile),
                         updated_at = ?
                     WHERE account_id = ?
                     """,
@@ -1108,6 +1208,7 @@ def save_persona(account_id: int, persona_data: Dict[str, Any]) -> Optional[int]
                         persona_data.get("activity_level"),
                         persona_data.get("full_description"),
                         persona_data.get("background_story"),
+                        bp_json,
                         datetime.utcnow(),
                         account_id
                     )
@@ -1121,9 +1222,9 @@ def save_persona(account_id: int, persona_data: Dict[str, Any]) -> Optional[int]
                         account_id, generated_name, age, gender, occupation,
                         city, country, personality_traits, interests,
                         communication_style, activity_level,
-                        full_description, background_story
+                        full_description, background_story, behavioral_profile
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         account_id,
@@ -1138,7 +1239,8 @@ def save_persona(account_id: int, persona_data: Dict[str, Any]) -> Optional[int]
                         persona_data.get("communication_style"),
                         persona_data.get("activity_level"),
                         persona_data.get("full_description"),
-                        persona_data.get("background_story")
+                        persona_data.get("background_story"),
+                        bp_json
                     )
                 )
                 persona_id = cursor.lastrowid
@@ -1196,11 +1298,251 @@ def get_persona(account_id: int) -> Optional[Dict[str, Any]]:
                     persona["personality_traits"] = json.loads(persona["personality_traits"])
                 if persona.get("interests"):
                     persona["interests"] = json.loads(persona["interests"])
+                if persona.get("behavioral_profile"):
+                    try:
+                        persona["behavioral_profile"] = json.loads(persona["behavioral_profile"])
+                    except (json.JSONDecodeError, TypeError):
+                        persona["behavioral_profile"] = None
                 return persona
             return None
     except Exception as e:
         logger.error(f"Error getting persona: {e}")
         return None
+
+
+# ========== BEHAVIORAL PROFILE ==========
+
+# Default behavioral parameters (used as fallback)
+DEFAULT_BEHAVIORAL_PROFILE = {
+    "timing": {
+        "min_action_delay": 3,
+        "max_action_delay": 10,
+        "long_pause_probability": 0.10,
+        "long_pause_extra_min": 5,
+        "long_pause_extra_max": 10
+    },
+    "reading": {
+        "speed_min": 3,
+        "speed_max": 6,
+        "max_read_time": 5,
+        "thinking_time_min": 0.5,
+        "thinking_time_max": 2.0
+    },
+    "engagement": {
+        "skip_probability": 0.15,
+        "react_probability": 0.10,
+        "save_probability_long": 0.05,
+        "save_probability_short": 0.03
+    },
+    "joining": {
+        "max_per_hour": 3,
+        "min_interval_minutes": 10
+    },
+    "conversation": {
+        "min_response_delay": 300,
+        "max_response_delay": 3600,
+        "max_messages": 20,
+        "max_age_hours": 72,
+        "end_probability_threshold": 15,
+        "end_probability": 0.15,
+        "busy_pause_probability": 0.10
+    },
+    "messaging": {
+        "typing_delay_per_char_min": 0.05,
+        "typing_delay_per_char_max": 0.10,
+        "silent_message_probability": 0.85
+    },
+    "llm": {
+        "temperature_offset": -0.05
+    },
+    "fallback_phrases": [
+        "Интересно! Спасибо за информацию.",
+        "Хм, надо подумать над этим.",
+        "Согласен, хороший момент."
+    ]
+}
+
+# Pool of fallback phrases for randomization across accounts
+_FALLBACK_PHRASES_POOL = [
+    "Интересно, не знал об этом!",
+    "Хм, звучит логично.",
+    "Спасибо, полезная информация!",
+    "Да, я тоже об этом думал.",
+    "Любопытно, надо будет посмотреть.",
+    "О, это интересный взгляд на вещи.",
+    "Согласен, хороший момент.",
+    "Ну да, так и есть.",
+    "А, понятно, спасибо!",
+    "Хороший совет, возьму на заметку.",
+    "Точно, я слышал что-то подобное.",
+    "Ага, понял, спасибо за разъяснение.",
+    "Ого, не ожидал такого.",
+    "Да уж, есть над чем подумать.",
+    "Интересная мысль, надо обдумать.",
+    "Ну, в целом согласен.",
+    "Хмм, любопытно получается.",
+    "О, классно! Не знал.",
+    "Спасибо что поделился!",
+    "Надо будет попробовать.",
+    "А, вот оно что, спасибо!",
+    "Логично, я примерно так и думал.",
+    "Круто, буду иметь в виду.",
+    "Звучит разумно, согласен.",
+]
+
+
+def generate_behavioral_profile(account_id: int, persona_data: Dict[str, Any] = None) -> Dict[str, Any]:
+    """
+    Generate a unique behavioral profile for an account.
+
+    Uses deterministic seed based on account_id so profile is reproducible.
+    Takes into account persona's activity_level if available.
+
+    Args:
+        account_id: Account ID (used as seed)
+        persona_data: Optional persona data for activity_level influence
+
+    Returns:
+        Behavioral profile dict
+    """
+    # Deterministic random based on account_id
+    seed = hashlib.md5(f"behavioral_{account_id}".encode()).hexdigest()
+    rng = random.Random(seed)
+
+    # Activity level modifier: calm=0.8, moderate=1.0, active=1.2
+    activity_level = (persona_data or {}).get("activity_level", "moderate")
+    if activity_level == "low" or activity_level == "calm":
+        activity_mod = 0.8
+    elif activity_level == "high" or activity_level == "active":
+        activity_mod = 1.2
+    else:
+        activity_mod = 1.0
+
+    def _uniform(low, high):
+        return round(rng.uniform(low, high), 3)
+
+    def _uniform_int(low, high):
+        return rng.randint(low, high)
+
+    # Generate timing parameters
+    min_action_delay = _uniform(2, 8)
+    max_action_delay = _uniform(max(min_action_delay + 2, 8), 25)
+    long_pause_extra_min = _uniform(3, 8)
+    long_pause_extra_max = _uniform(max(long_pause_extra_min + 2, 8), 20)
+
+    # Reading parameters
+    speed_min = _uniform(2, 5)
+    speed_max = _uniform(max(speed_min + 1, 4), 8)
+    thinking_time_min = _uniform(0.3, 1.5)
+    thinking_time_max = _uniform(max(thinking_time_min + 0.3, 1.0), 4.0)
+
+    # Conversation parameters
+    min_response_delay = _uniform_int(180, 600)
+    max_response_delay = _uniform_int(max(min_response_delay + 600, 1800), 5400)
+    end_probability_threshold = _uniform_int(10, 20)
+
+    # Apply activity modifier to delays (active = shorter delays)
+    min_action_delay = round(min_action_delay / activity_mod, 3)
+    max_action_delay = round(max_action_delay / activity_mod, 3)
+
+    # Select unique fallback phrases
+    phrases = rng.sample(_FALLBACK_PHRASES_POOL, k=rng.randint(3, 5))
+
+    profile = {
+        "timing": {
+            "min_action_delay": min_action_delay,
+            "max_action_delay": max_action_delay,
+            "long_pause_probability": _uniform(0.05, 0.20),
+            "long_pause_extra_min": long_pause_extra_min,
+            "long_pause_extra_max": long_pause_extra_max
+        },
+        "reading": {
+            "speed_min": speed_min,
+            "speed_max": speed_max,
+            "max_read_time": _uniform(4, 8),
+            "thinking_time_min": thinking_time_min,
+            "thinking_time_max": thinking_time_max
+        },
+        "engagement": {
+            "skip_probability": _uniform(0.05, 0.25),
+            "react_probability": _uniform(0.03, 0.20),
+            "save_probability_long": _uniform(0.02, 0.10),
+            "save_probability_short": _uniform(0.01, 0.06)
+        },
+        "joining": {
+            "max_per_hour": _uniform_int(2, 4),
+            "min_interval_minutes": _uniform_int(7, 18)
+        },
+        "conversation": {
+            "min_response_delay": min_response_delay,
+            "max_response_delay": max_response_delay,
+            "max_messages": _uniform_int(12, 30),
+            "max_age_hours": _uniform_int(48, 120),
+            "end_probability_threshold": end_probability_threshold,
+            "end_probability": _uniform(0.08, 0.25),
+            "busy_pause_probability": _uniform(0.05, 0.18)
+        },
+        "messaging": {
+            "typing_delay_per_char_min": _uniform(0.03, 0.08),
+            "typing_delay_per_char_max": _uniform(0.06, 0.15),
+            "silent_message_probability": _uniform(0.70, 0.95)
+        },
+        "llm": {
+            "temperature_offset": _uniform(-0.1, 0.0)
+        },
+        "fallback_phrases": phrases
+    }
+
+    return profile
+
+
+def get_behavioral_profile(account_id: int) -> Dict[str, Any]:
+    """
+    Get behavioral profile for an account.
+
+    Loads from DB if exists, generates and saves if not.
+    Falls back to defaults on any error.
+
+    Args:
+        account_id: Account ID
+
+    Returns:
+        Behavioral profile dict (never None)
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT behavioral_profile FROM personas WHERE account_id = ?",
+                (account_id,)
+            )
+            row = cursor.fetchone()
+
+            if row and row["behavioral_profile"]:
+                try:
+                    profile = json.loads(row["behavioral_profile"])
+                    if isinstance(profile, dict) and "timing" in profile:
+                        return profile
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Generate new profile
+            persona_data = get_persona(account_id)
+            profile = generate_behavioral_profile(account_id, persona_data)
+
+            # Save to DB
+            cursor.execute(
+                "UPDATE personas SET behavioral_profile = ? WHERE account_id = ?",
+                (json.dumps(profile, ensure_ascii=False), account_id)
+            )
+            conn.commit()
+
+            logger.info(f"Generated behavioral profile for account {account_id}")
+            return profile
+
+    except Exception as e:
+        logger.error(f"Error getting behavioral profile for account {account_id}: {e}")
+        return DEFAULT_BEHAVIORAL_PROFILE.copy()
 
 
 # ========== DISCOVERED CHATS CRUD ==========
@@ -1311,6 +1653,7 @@ def get_relevant_chats(
 def update_chat_joined(account_id: int, chat_username: str, chat_type: str = None) -> bool:
     """
     Mark chat as joined and increment joined_channels_count in accounts table.
+    Uses UPSERT logic - creates record if doesn't exist, updates if it does.
     Also updates chat_type if provided (to fix incorrect types from search).
 
     Args:
@@ -1324,47 +1667,61 @@ def update_chat_joined(account_id: int, chat_username: str, chat_type: str = Non
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
+            now = datetime.utcnow().isoformat()
 
-            # Check if already joined to avoid double-counting
+            # Check if record exists and if already joined
             cursor.execute(
-                "SELECT is_joined FROM discovered_chats WHERE account_id = ? AND chat_username = ?",
+                "SELECT id, is_joined FROM discovered_chats WHERE account_id = ? AND chat_username = ?",
                 (account_id, chat_username)
             )
             row = cursor.fetchone()
-            already_joined = row and row[0] == 1
 
-            # Update discovered_chats with correct chat_type
-            if chat_type:
+            if row is None:
+                # Record doesn't exist - INSERT new record
                 cursor.execute(
                     """
-                    UPDATE discovered_chats
-                    SET is_joined = 1, joined_at = ?, chat_type = ?
-                    WHERE account_id = ? AND chat_username = ?
+                    INSERT INTO discovered_chats
+                    (account_id, chat_username, chat_type, is_joined, joined_at, discovered_at)
+                    VALUES (?, ?, ?, 1, ?, ?)
                     """,
-                    (datetime.utcnow(), chat_type, account_id, chat_username)
+                    (account_id, chat_username, chat_type or 'unknown', now, now)
                 )
+                already_joined = False
+                logger.info(f"Created new discovered_chats record for {chat_username}")
             else:
-                cursor.execute(
-                    """
-                    UPDATE discovered_chats
-                    SET is_joined = 1, joined_at = ?
-                    WHERE account_id = ? AND chat_username = ?
-                    """,
-                    (datetime.utcnow(), account_id, chat_username)
-                )
-            
+                already_joined = row[1] == 1
+                # Record exists - UPDATE it
+                if chat_type:
+                    cursor.execute(
+                        """
+                        UPDATE discovered_chats
+                        SET is_joined = 1, joined_at = ?, chat_type = ?
+                        WHERE account_id = ? AND chat_username = ?
+                        """,
+                        (now, chat_type, account_id, chat_username)
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE discovered_chats
+                        SET is_joined = 1, joined_at = ?
+                        WHERE account_id = ? AND chat_username = ?
+                        """,
+                        (now, account_id, chat_username)
+                    )
+
             # Increment joined_channels_count in accounts if this is a new join
             if not already_joined:
                 cursor.execute(
                     """
-                    UPDATE accounts 
+                    UPDATE accounts
                     SET joined_channels_count = joined_channels_count + 1
                     WHERE id = ?
                     """,
                     (account_id,)
                 )
                 logger.info(f"Incremented joined_channels_count for account {account_id}")
-            
+
             conn.commit()
             return True
     except Exception as e:
@@ -2569,6 +2926,147 @@ def count_active_bot_groups() -> int:
         return 0
 
 
+# =====================================================
+# Pending Group Joins (gradual member addition)
+# =====================================================
+
+def schedule_pending_group_join(
+    group_id: int,
+    account_id: int,
+    session_id: str,
+    scheduled_at: datetime
+) -> Optional[int]:
+    """
+    Schedule a pending group join for later execution.
+
+    Args:
+        group_id: Database group ID
+        account_id: Account ID to add
+        session_id: Session ID to add
+        scheduled_at: When to attempt the join
+
+    Returns:
+        Pending join ID if successful, None otherwise
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO pending_group_joins
+                (group_id, account_id, session_id, scheduled_at, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    group_id, account_id, session_id,
+                    scheduled_at.isoformat(), datetime.utcnow().isoformat()
+                )
+            )
+            conn.commit()
+            if cursor.lastrowid:
+                logger.info(
+                    f"Scheduled pending join: account {session_id[:8]} -> "
+                    f"group {group_id} at {scheduled_at}"
+                )
+            return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Error scheduling pending group join: {e}")
+        return None
+
+
+def get_pending_group_joins_due() -> List[Dict[str, Any]]:
+    """
+    Get pending group joins that are due for processing.
+
+    Returns:
+        List of pending joins ready to be processed
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT p.*, g.telegram_chat_id, g.telegram_invite_link,
+                       g.creator_session_id, g.status as group_status
+                FROM pending_group_joins p
+                JOIN bot_groups g ON p.group_id = g.id
+                WHERE p.status = 'pending'
+                AND p.scheduled_at <= ?
+                AND g.status = 'active'
+                ORDER BY p.scheduled_at ASC
+                LIMIT 5
+                """,
+                (datetime.utcnow().isoformat(),)
+            )
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting pending group joins: {e}")
+        return []
+
+
+def update_pending_group_join(
+    pending_id: int,
+    status: str,
+    error_message: str = None
+) -> bool:
+    """
+    Update the status of a pending group join.
+
+    Args:
+        pending_id: Pending join ID
+        status: New status (completed, failed, cancelled)
+        error_message: Optional error message if failed
+
+    Returns:
+        True if successful
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE pending_group_joins
+                SET status = ?, processed_at = ?, error_message = ?
+                WHERE id = ?
+                """,
+                (status, datetime.utcnow().isoformat(), error_message, pending_id)
+            )
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error updating pending group join: {e}")
+        return False
+
+
+def cancel_pending_joins_for_group(group_id: int) -> int:
+    """
+    Cancel all pending joins for a group (e.g., when group is archived).
+
+    Args:
+        group_id: Group ID
+
+    Returns:
+        Number of cancelled joins
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE pending_group_joins
+                SET status = 'cancelled', processed_at = ?
+                WHERE group_id = ? AND status = 'pending'
+                """,
+                (datetime.utcnow().isoformat(), group_id)
+            )
+            conn.commit()
+            return cursor.rowcount
+    except Exception as e:
+        logger.error(f"Error cancelling pending joins for group: {e}")
+        return 0
+
+
 def is_private_bot_group(chat_identifier: str) -> bool:
     """
     Check if a chat is a private bot group (not a real public chat).
@@ -2981,6 +3479,238 @@ def increment_chat_messages_sent(account_id: int, chat_username: str) -> bool:
         return False
 
 
+# ============================================
+# SENT MESSAGES AUDIT & MEMORY
+# ============================================
+
+def save_sent_message(
+    account_id: int,
+    chat_username: str,
+    message_text: str,
+    context_summary: str = None
+) -> Optional[int]:
+    """
+    Save a sent message for audit and persona memory.
+
+    Args:
+        account_id: Account ID
+        chat_username: Chat username
+        message_text: The actual message text sent
+        context_summary: Brief summary of what the message was responding to
+
+    Returns:
+        Message ID if successful, None otherwise
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO sent_messages (account_id, chat_username, message_text, context_summary, sent_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (account_id, chat_username, message_text, context_summary, datetime.utcnow())
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Error saving sent message: {e}")
+        return None
+
+
+def get_account_messages_in_chat(
+    account_id: int,
+    chat_username: str,
+    limit: int = 10
+) -> List[Dict[str, Any]]:
+    """
+    Get messages previously sent by account in a specific chat.
+
+    Used to:
+    1. Give persona memory of what they said
+    2. Avoid repetition
+    3. Maintain conversation consistency
+
+    Args:
+        account_id: Account ID
+        chat_username: Chat username
+        limit: Max messages to return (most recent first)
+
+    Returns:
+        List of message dicts with text and timestamp
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT message_text, context_summary, sent_at
+                FROM sent_messages
+                WHERE account_id = ? AND chat_username = ?
+                ORDER BY sent_at DESC
+                LIMIT ?
+                """,
+                (account_id, chat_username, limit)
+            )
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting account messages in chat: {e}")
+        return []
+
+
+def get_account_recent_messages(
+    account_id: int,
+    limit: int = 20
+) -> List[Dict[str, Any]]:
+    """
+    Get all recent messages sent by account across all chats.
+
+    Used for:
+    1. Overall persona memory
+    2. Detecting repetitive patterns
+    3. Audit
+
+    Args:
+        account_id: Account ID
+        limit: Max messages to return
+
+    Returns:
+        List of message dicts
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT chat_username, message_text, context_summary, sent_at
+                FROM sent_messages
+                WHERE account_id = ?
+                ORDER BY sent_at DESC
+                LIMIT ?
+                """,
+                (account_id, limit)
+            )
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting account recent messages: {e}")
+        return []
+
+
+def save_search_query(
+    account_id: int,
+    query: str,
+    results_count: int = 0,
+    chats_found: int = 0,
+    chats_joined: int = 0
+) -> Optional[int]:
+    """
+    Save a search query for history tracking.
+
+    Args:
+        account_id: Account ID
+        query: The search query used
+        results_count: Number of Google results
+        chats_found: Number of chats extracted
+        chats_joined: Number of chats account joined
+
+    Returns:
+        Query ID if successful
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO search_queries
+                (account_id, query, results_count, chats_found, chats_joined, searched_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (account_id, query, results_count, chats_found, chats_joined, datetime.utcnow())
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Error saving search query: {e}")
+        return None
+
+
+def get_previous_search_queries(
+    account_id: int,
+    limit: int = 20,
+    days: int = 30
+) -> List[Dict[str, Any]]:
+    """
+    Get previous search queries for an account.
+
+    Used to avoid repeating queries that didn't work.
+
+    Args:
+        account_id: Account ID
+        limit: Max queries to return
+        days: Only return queries from last N days
+
+    Returns:
+        List of query dicts with text and results
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT query, results_count, chats_found, chats_joined, searched_at
+                FROM search_queries
+                WHERE account_id = ?
+                AND searched_at > datetime('now', ?)
+                ORDER BY searched_at DESC
+                LIMIT ?
+                """,
+                (account_id, f'-{days} days', limit)
+            )
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting previous search queries: {e}")
+        return []
+
+
+def get_failed_search_queries(
+    account_id: int,
+    limit: int = 10
+) -> List[str]:
+    """
+    Get search queries that didn't find any usable chats.
+
+    Returns only query strings for easy LLM consumption.
+
+    Args:
+        account_id: Account ID
+        limit: Max queries to return
+
+    Returns:
+        List of failed query strings
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT query FROM search_queries
+                WHERE account_id = ?
+                AND chats_joined = 0
+                ORDER BY searched_at DESC
+                LIMIT ?
+                """,
+                (account_id, limit)
+            )
+            rows = cursor.fetchall()
+            return [row['query'] for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting failed search queries: {e}")
+        return []
+
+
 def get_joined_supergroups_count(account_id: int) -> int:
     """
     Count how many supergroups the account has joined.
@@ -3050,18 +3780,38 @@ def can_join_supergroup(account_id: int, warmup_stage: int) -> tuple[bool, str]:
     return True, f"Can join ({current_count}/{max_count} supergroups at stage {warmup_stage})"
 
 
-def can_send_message_in_chat(account_id: int, chat_username: str) -> bool:
+def can_send_message_in_chat(account_id: int, chat_username: str, max_total: int = 7) -> bool:
     """
-    Check if account can send a message in a chat (based on daily limit).
+    Check if account can send a message in a chat.
+
+    Checks:
+    1. Exclusivity - no other warmup accounts in this chat
+    2. Total message limit (7 per chat lifetime)
+    3. Daily message limit (3 per day)
 
     Args:
         account_id: Account ID
         chat_username: Chat username
+        max_total: Maximum total messages per chat (default 7)
 
     Returns:
         True if can send message
     """
     try:
+        # CHECK 1: Exclusivity - is this chat occupied by another warmup?
+        account = get_account_by_id(account_id)
+        if account and account.get('account_type') == 'warmup':
+            is_exclusive, existing_id = is_chat_exclusive_for_warmup(account_id, chat_username)
+            if not is_exclusive:
+                logger.warning(f"🚫 Account {account_id} blocked from {chat_username}: occupied by warmup {existing_id}")
+                return False
+
+        # CHECK 2: Total message limit (7 per chat lifetime)
+        if has_exceeded_total_chat_limit(account_id, chat_username, max_total):
+            logger.info(f"🚫 Account {account_id} exceeded total limit ({max_total}) for {chat_username}")
+            return False
+
+        # CHECK 3: Daily limit
         participation = get_or_create_chat_participation(account_id, chat_username)
 
         if not participation:
@@ -3084,21 +3834,116 @@ def can_send_message_in_chat(account_id: int, chat_username: str) -> bool:
         return True  # Allow on error
 
 
+# ============================================
+# WARMUP ACCOUNT ISOLATION FUNCTIONS
+# ============================================
+
+def is_chat_exclusive_for_warmup(account_id: int, chat_username: str) -> tuple[bool, Optional[int]]:
+    """
+    Check if a chat is exclusive for this warmup account (no other warmup accounts joined).
+
+    This prevents multiple warmup accounts from being in the same chat,
+    which could cause Telegram to link and ban them together.
+
+    Helper accounts are NOT subject to this restriction.
+
+    Args:
+        account_id: The account checking exclusivity
+        chat_username: The chat to check
+
+    Returns:
+        Tuple of (is_exclusive: bool, existing_account_id: int or None)
+        - (True, None) if no other warmup accounts in the chat
+        - (False, account_id) if another warmup account is already joined
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT dc.account_id
+                FROM discovered_chats dc
+                JOIN accounts a ON dc.account_id = a.id
+                WHERE dc.chat_username = ?
+                AND dc.is_joined = 1
+                AND dc.account_id != ?
+                AND a.account_type = 'warmup'
+                AND a.is_active = 1
+                AND a.is_deleted = 0
+                AND a.is_frozen = 0
+                LIMIT 1
+                """,
+                (chat_username, account_id)
+            )
+
+            row = cursor.fetchone()
+            if row:
+                return (False, row['account_id'])
+            return (True, None)
+    except Exception as e:
+        logger.error(f"Error checking chat exclusivity: {e}")
+        return (False, None)  # FAIL-CLOSE: Block on error to prevent linking
+
+
+def has_exceeded_total_chat_limit(account_id: int, chat_username: str, max_total: int = 7) -> bool:
+    """
+    Check if account has exceeded total message limit for a chat.
+
+    This limits the total number of messages an account can send to a single chat
+    over the entire warmup period (not just daily). This prevents accounts from
+    becoming too visible in any single chat.
+
+    Args:
+        account_id: Account ID
+        chat_username: Chat username
+        max_total: Maximum total messages allowed (default 7)
+
+    Returns:
+        True if limit exceeded, False otherwise
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT messages_sent FROM real_chat_participation
+                WHERE account_id = ? AND chat_username = ?
+                """,
+                (account_id, chat_username)
+            )
+
+            row = cursor.fetchone()
+            if not row:
+                return False  # No record = no messages sent
+
+            messages_sent = row['messages_sent'] or 0
+            return messages_sent >= max_total
+    except Exception as e:
+        logger.error(f"Error checking total chat limit: {e}")
+        return False  # Allow on error
+
+
 def get_chats_for_participation(
     account_id: int,
     min_relevance: float = 0.6,
-    limit: int = 5
+    limit: int = 5,
+    max_total_messages: int = 7
 ) -> List[Dict[str, Any]]:
     """
     Get joined chats where account can actively participate.
 
-    Returns groups (not channels) with high relevance where
-    the account hasn't exceeded daily message limits.
+    Returns groups (not channels) with high relevance where:
+    - The account hasn't exceeded daily message limits
+    - The account hasn't exceeded total message limit (7 per chat lifetime)
+    - No other warmup accounts are in the same chat (exclusivity rule)
 
     Args:
         account_id: Account ID
         min_relevance: Minimum relevance score
         limit: Max chats to return
+        max_total_messages: Maximum total messages per chat (default 7)
 
     Returns:
         List of chat dicts with participation stats
@@ -3125,15 +3970,29 @@ def get_chats_for_participation(
                 AND dc.is_active = 1
                 AND dc.relevance_score >= ?
                 AND dc.chat_type IN ('group', 'supergroup')
+                -- Daily message limit check
                 AND (
                     rcp.id IS NULL
                     OR rcp.messages_sent_today < rcp.daily_message_limit
                     OR date(rcp.last_limit_reset) < date('now')
                 )
+                -- Total message limit (7 per chat lifetime)
+                AND (rcp.id IS NULL OR rcp.messages_sent < ?)
+                -- Exclusivity: no other warmup accounts in this chat
+                AND NOT EXISTS (
+                    SELECT 1 FROM discovered_chats dc2
+                    JOIN accounts a2 ON dc2.account_id = a2.id
+                    WHERE dc2.chat_username = dc.chat_username
+                    AND dc2.is_joined = 1
+                    AND dc2.account_id != dc.account_id
+                    AND a2.account_type = 'warmup'
+                    AND a2.is_active = 1
+                    AND a2.is_deleted = 0
+                )
                 ORDER BY dc.relevance_score DESC, dc.last_activity_at DESC
                 LIMIT ?
                 """,
-                (account_id, min_relevance, limit)
+                (account_id, min_relevance, max_total_messages, limit)
             )
 
             rows = cursor.fetchall()
@@ -3141,6 +4000,155 @@ def get_chats_for_participation(
     except Exception as e:
         logger.error(f"Error getting chats for participation: {e}")
         return []
+
+
+def count_available_chats_for_account(
+    account_id: int,
+    min_relevance: float = 0.5,
+    max_total_messages: int = 7
+) -> Dict[str, int]:
+    """
+    Count available chats for account considering exclusivity rules.
+
+    Returns counts of:
+    - total_discovered: All discovered chats for this account
+    - joined: Chats already joined
+    - available_for_join: Chats that can be joined (not occupied by other warmup)
+    - available_for_participation: Joined chats where account can still send messages
+    - blocked_by_exclusivity: Chats occupied by other warmup accounts
+
+    This is used by scheduler to determine if account needs to search for new chats.
+
+    Args:
+        account_id: Account ID
+        min_relevance: Minimum relevance score to count
+        max_total_messages: Max messages per chat (for participation count)
+
+    Returns:
+        Dict with counts
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            # Total discovered chats with good relevance
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM discovered_chats
+                WHERE account_id = ?
+                AND is_active = 1
+                AND relevance_score >= ?
+                AND chat_type IN ('group', 'supergroup')
+                """,
+                (account_id, min_relevance)
+            )
+            total_discovered = cursor.fetchone()[0]
+
+            # Joined chats
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM discovered_chats
+                WHERE account_id = ?
+                AND is_joined = 1
+                AND is_active = 1
+                AND relevance_score >= ?
+                AND chat_type IN ('group', 'supergroup')
+                """,
+                (account_id, min_relevance)
+            )
+            joined = cursor.fetchone()[0]
+
+            # Chats blocked by exclusivity (other warmup already there)
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM discovered_chats dc
+                WHERE dc.account_id = ?
+                AND dc.is_active = 1
+                AND dc.relevance_score >= ?
+                AND dc.chat_type IN ('group', 'supergroup')
+                AND EXISTS (
+                    SELECT 1 FROM discovered_chats dc2
+                    JOIN accounts a2 ON dc2.account_id = a2.id
+                    WHERE dc2.chat_username = dc.chat_username
+                    AND dc2.is_joined = 1
+                    AND dc2.account_id != dc.account_id
+                    AND a2.account_type = 'warmup'
+                    AND a2.is_active = 1
+                    AND a2.is_deleted = 0
+                )
+                """,
+                (account_id, min_relevance)
+            )
+            blocked_by_exclusivity = cursor.fetchone()[0]
+
+            # Available for join (not joined, not blocked)
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM discovered_chats dc
+                WHERE dc.account_id = ?
+                AND dc.is_joined = 0
+                AND dc.is_active = 1
+                AND dc.relevance_score >= ?
+                AND dc.chat_type IN ('group', 'supergroup')
+                AND NOT EXISTS (
+                    SELECT 1 FROM discovered_chats dc2
+                    JOIN accounts a2 ON dc2.account_id = a2.id
+                    WHERE dc2.chat_username = dc.chat_username
+                    AND dc2.is_joined = 1
+                    AND dc2.account_id != dc.account_id
+                    AND a2.account_type = 'warmup'
+                    AND a2.is_active = 1
+                    AND a2.is_deleted = 0
+                )
+                """,
+                (account_id, min_relevance)
+            )
+            available_for_join = cursor.fetchone()[0]
+
+            # Available for participation (joined, not exceeded limits, exclusive)
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM discovered_chats dc
+                LEFT JOIN real_chat_participation rcp
+                    ON rcp.account_id = dc.account_id
+                    AND rcp.chat_username = dc.chat_username
+                WHERE dc.account_id = ?
+                AND dc.is_joined = 1
+                AND dc.is_active = 1
+                AND dc.relevance_score >= ?
+                AND dc.chat_type IN ('group', 'supergroup')
+                AND (rcp.id IS NULL OR rcp.messages_sent < ?)
+                AND NOT EXISTS (
+                    SELECT 1 FROM discovered_chats dc2
+                    JOIN accounts a2 ON dc2.account_id = a2.id
+                    WHERE dc2.chat_username = dc.chat_username
+                    AND dc2.is_joined = 1
+                    AND dc2.account_id != dc.account_id
+                    AND a2.account_type = 'warmup'
+                    AND a2.is_active = 1
+                    AND a2.is_deleted = 0
+                )
+                """,
+                (account_id, min_relevance, max_total_messages)
+            )
+            available_for_participation = cursor.fetchone()[0]
+
+            return {
+                "total_discovered": total_discovered,
+                "joined": joined,
+                "available_for_join": available_for_join,
+                "available_for_participation": available_for_participation,
+                "blocked_by_exclusivity": blocked_by_exclusivity,
+            }
+    except Exception as e:
+        logger.error(f"Error counting available chats: {e}")
+        return {
+            "total_discovered": 0,
+            "joined": 0,
+            "available_for_join": 0,
+            "available_for_participation": 0,
+            "blocked_by_exclusivity": 0,
+        }
 
 
 def get_accounts_eligible_for_real_chat_participation(
@@ -3422,24 +4430,41 @@ def get_last_join_time(account_id: int) -> Optional[datetime]:
         return None
 
 
-def can_join_channel(account_id: int, max_per_hour: int = 3, min_interval_minutes: int = 10) -> tuple:
+def can_join_channel(
+    account_id: int,
+    chat_username: str = None,
+    max_per_hour: int = 3,
+    min_interval_minutes: int = 10
+) -> tuple:
     """
-    Check if account can join a new channel (rate limiting).
-    
+    Check if account can join a new channel (rate limiting + exclusivity).
+
+    For warmup accounts, also checks that no other warmup account is
+    already in the target chat (exclusivity rule to prevent linking).
+
     Args:
         account_id: Account ID
+        chat_username: Target chat username (for exclusivity check)
         max_per_hour: Maximum joins per hour
         min_interval_minutes: Minimum minutes between joins
-        
+
     Returns:
         Tuple of (can_join: bool, reason: str)
     """
     try:
+        # Check exclusivity for warmup accounts
+        if chat_username:
+            account = get_account_by_id(account_id)
+            if account and account.get('account_type') == 'warmup':
+                is_exclusive, existing_id = is_chat_exclusive_for_warmup(account_id, chat_username)
+                if not is_exclusive:
+                    return (False, f"Chat occupied by warmup account {existing_id}")
+
         # Check hourly limit
         recent_count = get_recent_joins_count(account_id, minutes=60)
         if recent_count >= max_per_hour:
             return (False, f"Hourly limit reached ({recent_count}/{max_per_hour} joins in last hour)")
-        
+
         # Check minimum interval
         last_join = get_last_join_time(account_id)
         if last_join:
@@ -3447,9 +4472,9 @@ def can_join_channel(account_id: int, max_per_hour: int = 3, min_interval_minute
             if minutes_since < min_interval_minutes:
                 wait_minutes = min_interval_minutes - minutes_since
                 return (False, f"Too soon since last join ({minutes_since:.1f} min ago, need {min_interval_minutes} min interval)")
-        
+
         return (True, f"OK ({recent_count}/{max_per_hour} joins this hour)")
     except Exception as e:
         logger.error(f"Error checking can_join_channel: {e}")
-        return (True, "Error checking rate limit, allowing join")
+        return (False, "Error checking rate limit, blocking join for safety")
 

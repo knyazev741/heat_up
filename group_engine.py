@@ -18,7 +18,10 @@ from database import (
     add_group_member, get_group_members, update_group_member,
     save_group_message, get_group_messages, get_last_group_message,
     count_active_bot_groups, get_accounts_without_group_membership,
-    get_accounts_eligible_for_dm, MIN_STAGE_FOR_DM
+    get_accounts_eligible_for_dm, MIN_STAGE_FOR_DM,
+    schedule_pending_group_join, get_pending_group_joins_due,
+    update_pending_group_join, cancel_pending_joins_for_group,
+    get_behavioral_profile, DEFAULT_BEHAVIORAL_PROFILE
 )
 from conversation_agent import get_conversation_agent
 from telegram_client import TelegramAPIClient
@@ -72,13 +75,18 @@ class GroupEngine:
         self.admin_api = get_admin_api_client()
 
         # Configuration
-        self.max_active_groups = 20  # Total limit
+        self.max_active_groups = 15  # Total limit (reduced)
         self.min_members_per_group = 3  # Minimum members
-        self.max_members_per_group = 10  # Maximum members
-        self.min_activity_interval_minutes = 30  # Minimum between messages
-        self.max_activity_interval_minutes = 240  # Maximum between messages (4 hours)
-        self.max_messages_per_group = 200  # Archive group after this
-        self.max_group_age_days = 14  # Archive group after this
+        self.max_members_per_group = 5  # Maximum members (variable 3-5)
+        self.min_activity_interval_minutes = 120  # Minimum 2 hours between messages
+        self.max_activity_interval_minutes = 720  # Maximum 12 hours between messages
+        self.max_messages_per_group = 100  # Archive group after this (reduced)
+        self.max_group_age_days = 21  # Archive group after 3 weeks
+
+        # Gradual joining configuration - members join over days, not minutes
+        self.immediate_members_on_create = 1  # Only add 1 member immediately
+        self.min_join_delay_hours = 24  # Minimum 1 day before next member joins
+        self.max_join_delay_hours = 96  # Maximum 4 days delay
 
     async def create_new_group(
         self,
@@ -169,25 +177,56 @@ class GroupEngine:
             role="admin"
         )
 
-        # 7. Add initial members if provided
+        # 7. Add initial members - gradual joining to avoid bot detection
+        # Only add 1 member immediately, schedule others for later days
         if initial_member_ids:
             added_count = 0
-            for member_session_id in initial_member_ids[:self.max_members_per_group - 1]:
-                if member_session_id == creator_session_id:
+            scheduled_count = 0
+            members_to_add = [m for m in initial_member_ids[:self.max_members_per_group - 1]
+                           if m != creator_session_id]
+
+            for i, member_session_id in enumerate(members_to_add):
+                member_account = get_account(member_session_id)
+                if not member_account:
                     continue
 
-                success = await self._add_member_to_group(
-                    group_id=group_id,
-                    telegram_chat_id=telegram_chat_id,
-                    telegram_invite_link=telegram_invite_link,
-                    member_session_id=member_session_id,
-                    inviter_session_id=creator_session_id
-                )
-                if success:
-                    added_count += 1
+                if i < self.immediate_members_on_create:
+                    # Add first member(s) immediately
+                    success = await self._add_member_to_group(
+                        group_id=group_id,
+                        telegram_chat_id=telegram_chat_id,
+                        telegram_invite_link=telegram_invite_link,
+                        member_session_id=member_session_id,
+                        inviter_session_id=creator_session_id
+                    )
+                    if success:
+                        added_count += 1
+                else:
+                    # Schedule remaining members for later days
+                    # Each subsequent member joins 12-72 hours after the previous
+                    base_delay = (i - self.immediate_members_on_create) * self.min_join_delay_hours
+                    random_delay = random.randint(
+                        base_delay + self.min_join_delay_hours,
+                        base_delay + self.max_join_delay_hours
+                    )
+                    scheduled_at = datetime.utcnow() + timedelta(hours=random_delay)
+
+                    schedule_pending_group_join(
+                        group_id=group_id,
+                        account_id=member_account["id"],
+                        session_id=member_session_id,
+                        scheduled_at=scheduled_at
+                    )
+                    scheduled_count += 1
 
             # Update member count
             update_bot_group(group_id, member_count=1 + added_count)
+
+            if scheduled_count > 0:
+                logger.info(
+                    f"Scheduled {scheduled_count} members for gradual joining "
+                    f"to group {group_id} over next {self.max_join_delay_hours * scheduled_count}h"
+                )
 
         # 8. Schedule first activity
         next_activity = datetime.utcnow() + timedelta(
@@ -339,6 +378,9 @@ class GroupEngine:
                     f"Error processing group {group.get('id')}: {e}"
                 )
 
+            # Anti-linking: delay between groups
+            await asyncio.sleep(random.uniform(5, 15))
+
         if messages_sent > 0:
             logger.info(f"Processed {messages_sent} group activities")
 
@@ -415,11 +457,14 @@ class GroupEngine:
             )
 
         # Send message via Telegram (use raw TL for groups)
+        bp = get_behavioral_profile(sender_account_id)
+        bp_msg = bp.get("messaging", DEFAULT_BEHAVIORAL_PROFILE["messaging"])
+        silent = random.random() < bp_msg.get("silent_message_probability", 0.85)
         send_result = await self.telegram.send_message_to_group(
             session_id=sender_session_id,
             chat_id=telegram_chat_id,
             text=message_text,
-            silent=True
+            silent=silent
         )
 
         if send_result.get("error"):
@@ -814,49 +859,50 @@ class GroupEngine:
             logger.debug("No warmup accounts available to create group")
             return 0
 
-        creator = warmup_accounts[0]
-        remaining_warmup = warmup_accounts[1:]
+        # CRITICAL: Groups must contain ONLY 1 warmup (creator) + helpers
+        # This prevents warmup accounts from being linked to each other
+        # Minimum 2 helpers required (so group has 1 warmup + 2 helpers = 3 members)
+        min_helpers_required = self.min_members_per_group - 1  # -1 for creator
 
-        # Shuffle helpers for randomness
-        random.shuffle(helper_accounts)
-
-        # Decide group composition strategy
-        prefer_helpers = random.random() < 0.7  # 70% chance to prefer helpers
-
-        if prefer_helpers and len(helper_accounts) >= 2:
-            # Mostly helpers: 1-2 warmup + rest helpers
-            max_warmup_members = min(2, len(remaining_warmup))
-            warmup_to_add = remaining_warmup[:max_warmup_members]
-            slots_for_helpers = self.max_members_per_group - 1 - len(warmup_to_add)
-            helpers_to_add = helper_accounts[:slots_for_helpers]
-            potential_members = warmup_to_add + helpers_to_add
-        else:
-            # Mixed: helpers first, then fill with warmup
-            # This still prefers helpers but allows more warmup if needed
-            potential_members = helper_accounts + remaining_warmup
-            potential_members = potential_members[:self.max_members_per_group - 1]
-
-        # Shuffle to mix warmup and helpers randomly in the list
-        random.shuffle(potential_members)
-
-        initial_members = [acc["session_id"] for acc in potential_members]
-
-        if len(initial_members) < self.min_members_per_group - 1:
+        if len(helper_accounts) < min_helpers_required:
             logger.debug(
-                f"Not enough members for new group "
-                f"({len(initial_members) + 1} < {self.min_members_per_group})"
+                f"Not enough helper accounts for new group "
+                f"({len(helper_accounts)} < {min_helpers_required}). "
+                f"Skipping to avoid warmup-warmup linkage."
             )
             return 0
 
-        # Choose random group type
-        group_type = random.choice(["friends", "thematic"])
+        # Random creator selection from warmup accounts
+        random.shuffle(warmup_accounts)
+        creator = warmup_accounts[0]
+
+        # Shuffle and select helpers (NO other warmup accounts!)
+        random.shuffle(helper_accounts)
+
+        # Variable group size for more natural behavior (3-max members)
+        target_members = random.randint(
+            self.min_members_per_group,
+            self.max_members_per_group
+        )
+        helpers_to_add = helper_accounts[:target_members - 1]  # -1 for creator
+
+        potential_members = helpers_to_add
+        initial_members = [acc["session_id"] for acc in potential_members]
+
+        if len(initial_members) < min_helpers_required:
+            logger.debug(
+                f"Not enough helpers for new group "
+                f"({len(initial_members)} < {min_helpers_required})"
+            )
+            return 0
+
+        # Choose random group type with more variety
+        group_type = random.choice(["friends", "friends", "thematic", "work"])
 
         # Log member composition
-        warmup_count = sum(1 for a in potential_members if a.get("account_type") == "warmup")
-        helper_count = len(potential_members) - warmup_count
         logger.info(
-            f"Creating group: 1 warmup creator + {warmup_count} warmup + {helper_count} helpers "
-            f"(prefer_helpers={prefer_helpers})"
+            f"Creating group: 1 warmup creator + {len(helpers_to_add)} helpers "
+            f"(no warmup-warmup linkage)"
         )
 
         result = await self.create_new_group(
@@ -870,6 +916,68 @@ class GroupEngine:
             return 1
 
         return 0
+
+    async def process_pending_group_joins(self) -> int:
+        """
+        Process scheduled pending group joins.
+        This adds members to groups gradually over time.
+
+        Returns:
+            Number of members successfully added
+        """
+        pending_joins = get_pending_group_joins_due()
+
+        if not pending_joins:
+            return 0
+
+        added_count = 0
+
+        for pending in pending_joins:
+            pending_id = pending["id"]
+            group_id = pending["group_id"]
+            session_id = pending["session_id"]
+            telegram_chat_id = pending.get("telegram_chat_id")
+            telegram_invite_link = pending.get("telegram_invite_link")
+            creator_session_id = pending.get("creator_session_id")
+
+            # Check if group is still active
+            if pending.get("group_status") != "active":
+                update_pending_group_join(
+                    pending_id, "cancelled",
+                    "Group no longer active"
+                )
+                continue
+
+            try:
+                # Try to add member
+                success = await self._add_member_to_group(
+                    group_id=group_id,
+                    telegram_chat_id=telegram_chat_id,
+                    telegram_invite_link=telegram_invite_link,
+                    member_session_id=session_id,
+                    inviter_session_id=creator_session_id
+                )
+
+                if success:
+                    update_pending_group_join(pending_id, "completed")
+                    added_count += 1
+                    logger.info(
+                        f"Processed pending join: {session_id[:8]} -> group {group_id}"
+                    )
+                else:
+                    update_pending_group_join(
+                        pending_id, "failed",
+                        "Failed to join group"
+                    )
+
+            except Exception as e:
+                logger.error(f"Error processing pending join {pending_id}: {e}")
+                update_pending_group_join(pending_id, "failed", str(e))
+
+        if added_count > 0:
+            logger.info(f"Processed {added_count} pending group joins")
+
+        return added_count
 
 
 # Singleton instance

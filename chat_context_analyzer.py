@@ -39,7 +39,8 @@ class ChatContextAnalyzer:
         self,
         messages: List[Dict[str, Any]],
         persona: Dict[str, Any],
-        chat_info: Dict[str, Any] = None
+        chat_info: Dict[str, Any] = None,
+        persona_messages: List[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Analyze recent messages in a chat to determine if and how to respond.
@@ -48,6 +49,7 @@ class ChatContextAnalyzer:
             messages: List of recent messages from the chat
             persona: Account's persona data
             chat_info: Optional chat metadata (title, type, etc.)
+            persona_messages: Previous messages sent by this persona in this chat (for memory)
 
         Returns:
             Analysis result with:
@@ -83,12 +85,28 @@ class ChatContextAnalyzer:
 - Участников: {chat_info.get('member_count', 'неизвестно')}
 """
 
+        # Build persona memory context (what they said before in this chat)
+        memory_context = ""
+        if persona_messages:
+            memory_lines = []
+            for pm in persona_messages[:5]:  # Last 5 messages
+                text = pm.get('message_text', '')[:150]
+                sent_at = pm.get('sent_at', '')[:10]
+                memory_lines.append(f"  [{sent_at}] \"{text}...\"")
+            if memory_lines:
+                memory_context = f"""
+МОИ ПРЕДЫДУЩИЕ СООБЩЕНИЯ В ЭТОМ ЧАТЕ (помни о них!):
+{chr(10).join(memory_lines)}
+
+ВАЖНО: Не повторяй то, что уже писал! Не противоречь себе!
+"""
+
         prompt = f"""Ты анализируешь групповой чат в Telegram чтобы определить, стоит ли человеку вступить в разговор.
 
 {persona_context}
 
 {chat_context}
-
+{memory_context}
 ПОСЛЕДНИЕ СООБЩЕНИЯ В ЧАТЕ:
 {formatted_messages}
 
@@ -140,7 +158,7 @@ class ChatContextAnalyzer:
                 temperature=0.7,
                 max_tokens=800,
                 messages=[
-                    {"role": "system", "content": "Ты эксперт по анализу социальных взаимодействий в мессенджерах. Отвечай только JSON."},
+                    {"role": "system", "content": f"Ты эксперт по анализу социальных взаимодействий в мессенджерах. Стиль общения персоны: {persona.get('communication_style', 'дружелюбный')}. Отвечай только JSON."},
                     {"role": "user", "content": prompt}
                 ]
             )
@@ -185,7 +203,8 @@ class ChatContextAnalyzer:
         messages: List[Dict[str, Any]],
         persona: Dict[str, Any],
         target_message_id: Optional[int] = None,
-        topic_hint: Optional[str] = None
+        topic_hint: Optional[str] = None,
+        persona_messages: List[Dict[str, Any]] = None
     ) -> Optional[str]:
         """
         Generate a contextual response based on chat history.
@@ -195,6 +214,7 @@ class ChatContextAnalyzer:
             persona: Account's persona
             target_message_id: Specific message to reply to
             topic_hint: Optional topic to focus on
+            persona_messages: Previous messages sent by this persona (for memory)
 
         Returns:
             Generated response text or None
@@ -215,33 +235,55 @@ class ChatContextAnalyzer:
         if topic_hint:
             topic_context = f"\nТЕМА РАЗГОВОРА: {topic_hint}"
 
-        prompt = f"""{persona_context}
+        # Build persona memory context
+        memory_context = ""
+        if persona_messages:
+            memory_lines = []
+            for pm in persona_messages[:7]:  # Last 7 messages for better context
+                text = pm.get('message_text', '')[:200]
+                memory_lines.append(f"  • \"{text}\"")
+            if memory_lines:
+                memory_context = f"""
+🧠 МОИ ПРЕДЫДУЩИЕ СООБЩЕНИЯ (ПОМНИ!):
+{chr(10).join(memory_lines)}
 
+⚠️ КРИТИЧНО:
+- НЕ повторяй то, что уже писал!
+- НЕ противоречь своим предыдущим словам!
+- Помни свою позицию по темам!
+"""
+
+        prompt = f"""{persona_context}
+{memory_context}
 ПОСЛЕДНИЕ СООБЩЕНИЯ В ЧАТЕ:
 {formatted_messages}
 {target_context}
 {topic_context}
 
 ТВОЯ ЗАДАЧА:
-Напиши ОДНО естественное сообщение в этот чат.
+Напиши ОДНО естественное сообщение как обычный человек в этом чате.
 
-ПРАВИЛА:
-1. Сообщение должно быть релевантным текущему разговору
-2. Используй СВОЙ стиль общения (из персоны)
-3. Будь кратким - 1-3 предложения максимум
-4. Не повторяй то, что уже сказали другие
-5. Можно:
-   - Ответить на вопрос если знаешь ответ
-   - Поделиться мнением по теме
-   - Задать уточняющий вопрос
-   - Поддержать чью-то идею
-6. НЕ НУЖНО:
-   - Представляться ("Привет, я Маша...")
-   - Использовать канцелярит
-   - Писать слишком формально
-   - Использовать много эмодзи
+🎯 КРИТЕРИИ ЕСТЕСТВЕННОСТИ:
+1. Пиши как РЕАЛЬНЫЙ человек, а не бот
+2. Используй разговорный язык, не канцелярит
+3. Ошибки допустимы - люди иногда опечатываются
+4. 1-2 предложения максимум (люди редко пишут длинно в чатах)
+5. Можно использовать сокращения: "норм", "ок", "кст" и т.д.
 
-ВЕРНИ ТОЛЬКО ТЕКСТ СООБЩЕНИЯ (без кавычек, без JSON):"""
+✅ МОЖНО:
+- Ответить на вопрос коротко и по делу
+- Поделиться личным опытом ("у меня было так...")
+- Согласиться/не согласиться с кем-то
+- Задать уточняющий вопрос
+
+❌ НЕЛЬЗЯ:
+- Представляться ("Привет, я Маша...")
+- Писать формально ("Хотелось бы отметить...")
+- Использовать много эмодзи (максимум 1)
+- Рекламировать что-либо
+- Повторять свои предыдущие сообщения
+
+ВЕРНИ ТОЛЬКО ТЕКСТ СООБЩЕНИЯ (без кавычек, без пояснений):"""
 
         try:
             response = self.client.chat.completions.create(
@@ -249,7 +291,7 @@ class ChatContextAnalyzer:
                 temperature=0.9,
                 max_tokens=200,
                 messages=[
-                    {"role": "system", "content": "Ты - человек, участвующий в групповом чате Telegram. Отвечай естественно, по-русски."},
+                    {"role": "system", "content": f"Ты - человек, участвующий в групповом чате Telegram. Стиль общения: {persona.get('communication_style', 'дружелюбный')}. Отвечай естественно, по-русски."},
                     {"role": "user", "content": prompt}
                 ]
             )
@@ -319,11 +361,17 @@ class ChatContextAnalyzer:
         if not persona:
             return "Ты - обычный пользователь Telegram."
 
+        city = persona.get('city')
+        city_line = f"\nГород: {city}" if city else ""
+
+        background = persona.get('background_story', '')
+        bg_line = f"\nО себе: {background[:200]}" if background else ""
+
         return f"""ТЫ - {persona.get('generated_name', 'Пользователь')}, {persona.get('age', 25)} лет.
 Профессия: {persona.get('occupation', 'не указана')}
 Интересы: {', '.join(persona.get('interests', ['общение']))}
 Стиль общения: {persona.get('communication_style', 'дружелюбный')}
-Характер: {', '.join(persona.get('personality_traits', ['общительный']))}"""
+Характер: {', '.join(persona.get('personality_traits', ['общительный']))}{city_line}{bg_line}"""
 
     def _validate_analysis(
         self,

@@ -19,7 +19,8 @@ from database import (
     get_last_conversation_message, get_accounts_without_active_conversations,
     get_potential_conversation_partners, count_active_conversations,
     get_accounts_for_social_activity, calculate_social_probability,
-    MIN_STAGE_FOR_DM
+    MIN_STAGE_FOR_DM,
+    get_behavioral_profile, DEFAULT_BEHAVIORAL_PROFILE
 )
 from conversation_agent import get_conversation_agent
 from telegram_client import TelegramAPIClient
@@ -44,13 +45,27 @@ class ConversationEngine:
         self.agent = get_conversation_agent()
         self.admin_api = get_admin_api_client()
 
-        # Configuration
-        self.max_active_conversations = 50  # Total limit
-        self.max_conversations_per_account = 3  # Per account limit
-        self.min_response_delay_seconds = 30  # Minimum delay between messages
-        self.max_response_delay_seconds = 600  # Maximum delay (10 minutes)
-        self.max_messages_per_conversation = 30  # End conversation after this
-        self.max_conversation_age_hours = 48  # End conversation after this
+        # Configuration - adjusted for more natural behavior
+        self.max_active_conversations = 25  # Reduced total limit
+        self.max_conversations_per_account = 2  # Per account limit (reduced)
+        self.min_response_delay_seconds = 300  # Minimum 5 minutes between messages
+        self.max_response_delay_seconds = 3600  # Maximum 1 hour delay
+        self.max_messages_per_conversation = 20  # End conversation earlier
+        self.max_conversation_age_hours = 72  # 3 days max
+
+    def _get_conversation_config(self, account_id: int) -> Dict[str, Any]:
+        """Get conversation config from behavioral profile with fallback to defaults"""
+        bp = get_behavioral_profile(account_id)
+        conv = bp.get("conversation", DEFAULT_BEHAVIORAL_PROFILE["conversation"])
+        return {
+            "min_response_delay": conv.get("min_response_delay", self.min_response_delay_seconds),
+            "max_response_delay": conv.get("max_response_delay", self.max_response_delay_seconds),
+            "max_messages": conv.get("max_messages", self.max_messages_per_conversation),
+            "max_age_hours": conv.get("max_age_hours", self.max_conversation_age_hours),
+            "end_probability_threshold": conv.get("end_probability_threshold", 15),
+            "end_probability": conv.get("end_probability", 0.15),
+            "busy_pause_probability": conv.get("busy_pause_probability", 0.10),
+        }
 
     async def can_initiate_dm_to_session(
         self,
@@ -475,8 +490,8 @@ class ConversationEngine:
             initiator_msgs = conversation.get("initiator_messages", 0)
             responder_msgs = conversation.get("responder_messages", 0) + 1
 
-        # Calculate next response delay
-        next_delay = self._calculate_next_response_delay(new_message_count)
+        # Calculate next response delay (use responder's profile for personalized timing)
+        next_delay = self._calculate_next_response_delay(new_message_count, account_id=responder_account_id)
         next_response = datetime.utcnow() + timedelta(seconds=next_delay)
 
         update_conversation(
@@ -495,22 +510,30 @@ class ConversationEngine:
 
         return True
 
-    def _calculate_next_response_delay(self, message_count: int) -> float:
+    def _calculate_next_response_delay(self, message_count: int, account_id: int = None) -> float:
         """
-        Calculate delay until next response.
+        Calculate delay until next response using behavioral profile.
 
         Longer conversations have longer pauses.
 
         Args:
             message_count: Number of messages so far
+            account_id: Account ID for profile-based delays
 
         Returns:
             Delay in seconds
         """
-        base_delay = random.uniform(
-            self.min_response_delay_seconds,
-            self.max_response_delay_seconds
-        )
+        if account_id:
+            config = self._get_conversation_config(account_id)
+            min_delay = config["min_response_delay"]
+            max_delay = config["max_response_delay"]
+            busy_prob = config["busy_pause_probability"]
+        else:
+            min_delay = self.min_response_delay_seconds
+            max_delay = self.max_response_delay_seconds
+            busy_prob = 0.10
+
+        base_delay = random.uniform(min_delay, max_delay)
 
         # Scale up for longer conversations
         if message_count > 10:
@@ -519,7 +542,7 @@ class ConversationEngine:
             base_delay *= 1.5
 
         # Sometimes add a longer pause (person is busy)
-        if random.random() < 0.1:  # 10% chance
+        if random.random() < busy_prob:
             base_delay += random.uniform(600, 1800)  # +10-30 minutes
 
         return base_delay
@@ -545,7 +568,7 @@ class ConversationEngine:
 
     async def _should_end_conversation(self, conversation: Dict[str, Any]) -> bool:
         """
-        Determine if conversation should end.
+        Determine if conversation should end using behavioral profile.
 
         Reasons:
         - Too many messages
@@ -560,8 +583,16 @@ class ConversationEngine:
         """
         message_count = conversation.get("message_count", 0)
 
+        # Use initiator's profile for conversation limits
+        initiator_id = conversation.get("initiator_account_id")
+        config = self._get_conversation_config(initiator_id) if initiator_id else {}
+        max_messages = config.get("max_messages", self.max_messages_per_conversation)
+        max_age = config.get("max_age_hours", self.max_conversation_age_hours)
+        end_threshold = config.get("end_probability_threshold", 15)
+        end_prob = config.get("end_probability", 0.15)
+
         # Hard limit on messages
-        if message_count >= self.max_messages_per_conversation:
+        if message_count >= max_messages:
             return True
 
         # Age limit
@@ -571,13 +602,13 @@ class ConversationEngine:
                 started_at = datetime.fromisoformat(str(started_at_str))
                 age_hours = (datetime.utcnow() - started_at).total_seconds() / 3600
 
-                if age_hours > self.max_conversation_age_hours:
+                if age_hours > max_age:
                     return True
             except:
                 pass
 
-        # Probabilistic ending after 15 messages
-        if message_count > 15 and random.random() < 0.15:  # 15% chance per message
+        # Probabilistic ending after threshold messages
+        if message_count > end_threshold and random.random() < end_prob:
             return True
 
         return False
@@ -711,7 +742,7 @@ class ConversationEngine:
             return 0
 
         new_conversations = 0
-        max_new_per_cycle = 5  # Increased from 3
+        max_new_per_cycle = 2  # Reduced to avoid bot detection
 
         for account in eligible_accounts:
             if new_conversations >= max_new_per_cycle:
@@ -764,6 +795,8 @@ class ConversationEngine:
                         f"(initiator has {total_convs} existing convs)"
                     )
                     new_conversations += 1
+                    # Anti-linking: delay between DM initiations
+                    await asyncio.sleep(random.uniform(10, 30))
                     break
 
         if new_conversations > 0:

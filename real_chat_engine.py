@@ -33,6 +33,7 @@ from database import (
     update_chat_participation,
     get_persona,
     get_account,
+    get_account_messages_in_chat,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,8 +134,8 @@ class RealChatEngine:
                     logger.error(f"Error processing account {account.get('session_id')}: {e}")
                     summary["errors"].append(str(e))
 
-                # Small delay between accounts
-                await asyncio.sleep(random.uniform(2, 5))
+                # Anti-linking: larger delay between accounts
+                await asyncio.sleep(random.uniform(15, 45))
 
         except Exception as e:
             logger.error(f"Error in real chat activity processing: {e}")
@@ -261,6 +262,9 @@ class RealChatEngine:
             logger.debug(f"Not enough messages in {chat_username} for context")
             return result
 
+        # Get persona's previous messages in this chat for memory
+        persona_messages = get_account_messages_in_chat(account_id, chat_username, limit=10)
+
         # Analyze context
         analysis = await self.analyzer.analyze_chat_context(
             messages=messages,
@@ -269,7 +273,8 @@ class RealChatEngine:
                 "title": chat.get("chat_title"),
                 "type": chat.get("chat_type"),
                 "member_count": chat.get("member_count")
-            }
+            },
+            persona_messages=persona_messages
         )
 
         # Save analysis result
@@ -297,7 +302,8 @@ class RealChatEngine:
                 messages=messages,
                 persona=persona,
                 target_message_id=analysis.get("target_message_id"),
-                topic_hint=analysis.get("topic")
+                topic_hint=analysis.get("topic"),
+                persona_messages=persona_messages
             )
 
         if not response_text:

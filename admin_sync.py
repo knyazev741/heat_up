@@ -7,6 +7,7 @@ that can be imported and used in other modules (like scheduler).
 
 import asyncio
 import logging
+import time
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from admin_api_client import AdminAPIClient
@@ -40,7 +41,12 @@ async def sync_session_statuses() -> Dict[str, Any]:
         
         # Sync deleted sessions
         deleted_ids = await _sync_deleted_sessions(client)
-        
+
+        # Verify active accounts individually (compensate for Admin API filter bug)
+        verified_deleted, verified_frozen = await _verify_active_accounts(client)
+        deleted_ids.update(verified_deleted)
+        frozen_ids.update(verified_frozen)
+
         # Sync banned forever sessions
         banned_forever_ids = await _sync_banned_forever_sessions(client)
         
@@ -255,6 +261,167 @@ async def _sync_banned_forever_sessions(client: AdminAPIClient) -> set:
     return banned_forever_ids
 
 
+async def _verify_active_accounts(client: AdminAPIClient) -> tuple[set, set]:
+    """
+    Verify each locally-active account individually via Admin API.
+
+    This compensates for the Admin API bug where `GET /sessions/?deleted=true`
+    doesn't return all deleted sessions. By checking each active account
+    one-by-one we catch zombies that the bulk filter misses.
+
+    Returns:
+        Tuple of (deleted_ids, frozen_ids) that were found and updated.
+    """
+    logger.info("🔍 Verifying active accounts individually via Admin API...")
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT session_id FROM accounts
+            WHERE is_active = 1 AND is_deleted = 0 AND is_frozen = 0
+              AND account_type = 'warmup'
+        """)
+        active_session_ids = [row[0] for row in cursor.fetchall()]
+
+    if not active_session_ids:
+        return set(), set()
+
+    verified_deleted = set()
+    verified_frozen = set()
+
+    for session_id in active_session_ids:
+        try:
+            session = await client.get_session_by_id(int(session_id))
+        except Exception as e:
+            logger.debug(f"Error verifying session {session_id}: {e}")
+            continue
+
+        if session is None:
+            # Not found in API → treat as deleted
+            verified_deleted.add(session_id)
+            continue
+
+        if session.get("deleted"):
+            verified_deleted.add(session_id)
+        if session.get("frozen"):
+            verified_frozen.add(session_id)
+
+    # Apply updates
+    if verified_deleted:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            placeholders = ','.join(['?' for _ in verified_deleted])
+            cursor.execute(
+                f"UPDATE accounts SET is_deleted = 1 WHERE session_id IN ({placeholders})",
+                list(verified_deleted)
+            )
+            conn.commit()
+        logger.warning(f"🧟 Marked {len(verified_deleted)} zombie-deleted accounts via individual verification")
+
+    if verified_frozen:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            placeholders = ','.join(['?' for _ in verified_frozen])
+            cursor.execute(
+                f"UPDATE accounts SET is_frozen = 1 WHERE session_id IN ({placeholders})",
+                list(verified_frozen)
+            )
+            conn.commit()
+        logger.warning(f"🧟 Marked {len(verified_frozen)} zombie-frozen accounts via individual verification")
+
+    logger.info(
+        f"✅ Verification done: {len(active_session_ids)} checked, "
+        f"{len(verified_deleted)} deleted, {len(verified_frozen)} frozen"
+    )
+    return verified_deleted, verified_frozen
+
+
+# ============================================
+# PRE-WARMUP STATUS VERIFICATION (with TTL cache)
+# ============================================
+
+# Simple TTL cache: {session_id: (result_dict, timestamp)}
+_status_cache: Dict[str, tuple] = {}
+_STATUS_CACHE_TTL = 1800  # 30 minutes
+
+
+async def verify_account_status_via_api(session_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Verify a single account's status via Admin API before warmup.
+
+    Returns None if the account is OK to proceed.
+    Returns a dict with problem details if the account should be skipped:
+        {"reason": str, "deleted": bool, "frozen": bool, "status": int}
+
+    Results are cached for 30 minutes to avoid overloading Admin API.
+    """
+    now = time.time()
+
+    # Check cache
+    if session_id in _status_cache:
+        cached_result, cached_at = _status_cache[session_id]
+        if now - cached_at < _STATUS_CACHE_TTL:
+            return cached_result
+
+    client = AdminAPIClient()
+    try:
+        session = await client.get_session_by_id(int(session_id))
+    except Exception as e:
+        logger.warning(f"Pre-warmup API check failed for {session_id}: {e}")
+        # On error, don't block warmup — return None (OK)
+        return None
+    finally:
+        await client.close()
+
+    if session is None:
+        result = {"reason": "session not found in Admin API", "deleted": True, "frozen": False, "status": None}
+        _update_local_status(session_id, is_deleted=True)
+        _status_cache[session_id] = (result, now)
+        return result
+
+    problems = []
+    is_deleted = session.get("deleted", False)
+    is_frozen = session.get("frozen", False)
+    status = session.get("status")
+
+    if is_deleted:
+        problems.append("deleted in Admin API")
+        _update_local_status(session_id, is_deleted=True)
+    if is_frozen:
+        problems.append("frozen in Admin API")
+        _update_local_status(session_id, is_frozen=True)
+    if status == 1:
+        problems.append("status=1 (in work, sending broadcasts)")
+
+    if problems:
+        result = {
+            "reason": "; ".join(problems),
+            "deleted": is_deleted,
+            "frozen": is_frozen,
+            "status": status,
+        }
+        _status_cache[session_id] = (result, now)
+        return result
+
+    # Account is OK
+    _status_cache[session_id] = (None, now)
+    return None
+
+
+def _update_local_status(session_id: str, is_deleted: bool = False, is_frozen: bool = False):
+    """Update local DB flags based on Admin API check."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            if is_deleted:
+                cursor.execute("UPDATE accounts SET is_deleted = 1 WHERE session_id = ?", (session_id,))
+            if is_frozen:
+                cursor.execute("UPDATE accounts SET is_frozen = 1 WHERE session_id = ?", (session_id,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error updating local status for {session_id}: {e}")
+
+
 def get_last_sync_time() -> Optional[datetime]:
     """Get the last sync time from a metadata table"""
     try:
@@ -416,9 +583,10 @@ async def sync_helper_accounts() -> Dict[str, Any]:
 
 
 def _create_helper_persona(cursor, account_id: int, first_name: str, last_name: str):
-    """Create a basic persona for helper account"""
+    """Create a basic persona for helper account with behavioral profile"""
     import random
     import json
+    from database import generate_behavioral_profile
 
     # Use real name from Telegram if available, otherwise generate
     if first_name:
@@ -427,30 +595,48 @@ def _create_helper_persona(cursor, account_id: int, first_name: str, last_name: 
         names = [
             "Алексей Петров", "Мария Иванова", "Дмитрий Сидоров",
             "Анна Козлова", "Сергей Новиков", "Елена Морозова",
-            "Андрей Волков", "Ольга Соколова", "Николай Лебедев"
+            "Андрей Волков", "Ольга Соколова", "Николай Лебедев",
+            "Татьяна Попова", "Виктор Михайлов", "Наталья Федорова",
+            "Павел Кузнецов", "Ирина Захарова", "Максим Орлов",
+            "Алена Белова", "Артём Соловьёв", "Юлия Васильева"
         ]
         generated_name = random.choice(names)
 
-    # Random interests
+    # Expanded interest pool (35+ options)
     all_interests = [
         "технологии", "спорт", "музыка", "кино", "путешествия",
-        "книги", "игры", "кулинария", "фотография", "искусство"
+        "книги", "игры", "кулинария", "фотография", "искусство",
+        "наука", "финансы", "мода", "автомобили", "здоровье",
+        "психология", "дизайн", "архитектура", "история", "политика",
+        "природа", "животные", "образование", "бизнес", "маркетинг",
+        "программирование", "рукоделие", "садоводство", "рыбалка", "йога",
+        "космос", "аниме", "настольные игры", "кроссфит", "кофе",
+        "вино", "танцы", "театр"
     ]
-    interests = random.sample(all_interests, k=random.randint(2, 4))
+    interests = random.sample(all_interests, k=random.randint(2, 5))
 
-    # Communication styles
-    styles = ["дружелюбный", "спокойный", "энергичный", "вдумчивый"]
+    # Expanded communication styles (12 options)
+    styles = [
+        "дружелюбный", "спокойный", "энергичный", "вдумчивый",
+        "ироничный", "лаконичный", "эмоциональный", "серьёзный",
+        "оптимистичный", "прагматичный", "любознательный", "сдержанный"
+    ]
+
+    # Generate behavioral profile
+    persona_data = {"activity_level": random.choice(["low", "moderate", "high"])}
+    bp = generate_behavioral_profile(account_id, persona_data)
 
     cursor.execute("""
         INSERT OR IGNORE INTO personas (
             account_id, generated_name, interests, communication_style,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            behavioral_profile, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
         account_id,
         generated_name,
         json.dumps(interests, ensure_ascii=False),
         random.choice(styles),
+        json.dumps(bp, ensure_ascii=False),
         datetime.utcnow().isoformat(),
         datetime.utcnow().isoformat()
     ))

@@ -5,7 +5,7 @@ import json
 from typing import List, Dict, Any
 from telegram_client import TelegramAPIClient
 from config import ACTION_DELAYS
-from database import save_session_action, update_account, get_account, is_chat_joined, can_join_channel
+from database import save_session_action, update_account, get_account, is_chat_joined, can_join_channel, get_behavioral_profile, DEFAULT_BEHAVIORAL_PROFILE
 
 logger = logging.getLogger(__name__)
 
@@ -49,20 +49,28 @@ class ActionExecutor:
         self.joined_channels = set()  # Track joined channels for this session
         
     async def execute_action_plan(
-        self, 
-        session_id: str, 
-        actions: List[Dict[str, Any]]
+        self,
+        session_id: str,
+        actions: List[Dict[str, Any]],
+        account_id: int = None
     ) -> Dict[str, Any]:
         """
         Execute a sequence of actions
-        
+
         Args:
             session_id: Telegram session UID
             actions: List of actions to perform
-            
+            account_id: Account ID for loading behavioral profile
+
         Returns:
             Execution summary with results
         """
+        # Load behavioral profile for this account
+        if account_id:
+            self._current_profile = get_behavioral_profile(account_id)
+        else:
+            self._current_profile = DEFAULT_BEHAVIORAL_PROFILE.copy()
+
         logger.info(f"Starting action execution for session {session_id} with {len(actions)} actions")
         
         results = []
@@ -242,10 +250,18 @@ class ActionExecutor:
 
         # Get account_id for spam protection checks
         account = get_account(session_id)
-        account_id = account["id"] if account else None
+        if not account:
+            logger.error(f"❌ Account not found for session {session_id} - blocking join for safety")
+            return {
+                "action": "join_channel",
+                "chat_username": chat_username,
+                "status": "error",
+                "reason": "Account not found in database"
+            }
+        account_id = account["id"]
 
         # CHECK 1: Already joined?
-        if account_id and is_chat_joined(account_id, chat_username):
+        if is_chat_joined(account_id, chat_username):
             logger.info(f"✅ Already joined {chat_username}, skipping duplicate join")
             return {
                 "action": "join_channel",
@@ -254,17 +270,22 @@ class ActionExecutor:
                 "reason": "Already joined"
             }
 
-        # CHECK 2: Rate limiting (max 3 per hour, min 10 min between joins)
-        if account_id:
-            can_join, reason = can_join_channel(account_id, max_per_hour=3, min_interval_minutes=10)
-            if not can_join:
-                logger.info(f"⏱️ Rate limit for {chat_username}: {reason}")
-                return {
-                    "action": "join_channel",
-                    "chat_username": chat_username,
-                    "status": "rate_limited",
-                    "reason": reason
-                }
+        # CHECK 2: Rate limiting + exclusivity (limits from behavioral profile)
+        bp = getattr(self, '_current_profile', None) or DEFAULT_BEHAVIORAL_PROFILE
+        bp_join = bp.get("joining", DEFAULT_BEHAVIORAL_PROFILE["joining"])
+        can_join, reason = can_join_channel(
+            account_id, chat_username,
+            max_per_hour=bp_join.get("max_per_hour", 3),
+            min_interval_minutes=bp_join.get("min_interval_minutes", 10)
+        )
+        if not can_join:
+            logger.info(f"⏱️ Rate limit/exclusivity for {chat_username}: {reason}")
+            return {
+                "action": "join_channel",
+                "chat_username": chat_username,
+                "status": "rate_limited",
+                "reason": reason
+            }
 
         # Check if user has premium (required by Telegram guidelines)
         session_info = await self.telegram_client.get_session_info(session_id)
@@ -324,12 +345,11 @@ class ActionExecutor:
                     chat_data = peer_result.get("chat_data", {})
                     if chat_data.get("megagroup"):
                         # This is a supergroup - check limits
-                        from database import get_account, can_join_supergroup
-                        account = get_account(session_id)
-                        if account:
-                            account_id = account['id']
-                            warmup_stage = account.get('warmup_stage', 0)
-                            can_join, reason = can_join_supergroup(account_id, warmup_stage)
+                        from database import can_join_supergroup
+                        acc = get_account(session_id)
+                        if acc:
+                            warmup_stage = acc.get('warmup_stage', 0)
+                            can_join, reason = can_join_supergroup(acc['id'], warmup_stage)
                             if not can_join:
                                 logger.info(f"🚫 Cannot join supergroup {chat_username}: {reason}")
                                 return {
@@ -344,6 +364,46 @@ class ActionExecutor:
 
         # Now join the chat
         result = await self.telegram_client.join_chat(session_id, chat_username)
+
+        error_str = str(result.get("error", "")).upper()
+
+        # Handle "already in chat" as success - just update our database
+        if "ALREADY" in error_str or "USER_ALREADY_PARTICIPANT" in error_str:
+            logger.info(f"✅ Already a member of {chat_username} - updating database")
+            self.joined_channels.add(chat_username)
+
+            # Update database to mark as joined — but check exclusivity first
+            try:
+                from database import update_chat_joined, is_chat_exclusive_for_warmup
+                acc = get_account(session_id)
+                if acc:
+                    # Check exclusivity for warmup accounts before syncing to DB
+                    if acc.get("account_type") == "warmup":
+                        is_exclusive, existing_id = is_chat_exclusive_for_warmup(acc['id'], chat_username)
+                        if not is_exclusive:
+                            logger.warning(
+                                f"⚠️ NOT syncing {chat_username} for warmup account {acc['id']}: "
+                                f"chat occupied by warmup account {existing_id} (exclusivity violation)"
+                            )
+                            return {
+                                "action": "join_channel",
+                                "chat_username": chat_username,
+                                "status": "already_joined_blocked",
+                                "success": False,
+                                "message": f"Already joined but chat occupied by warmup {existing_id}"
+                            }
+                    update_chat_joined(acc['id'], chat_username, chat_type or 'unknown')
+                    logger.info(f"✅ Synced {chat_username} membership to database")
+            except Exception as exc:
+                logger.error(f"Failed to sync membership to database: {exc}")
+
+            return {
+                "action": "join_channel",
+                "chat_username": chat_username,
+                "status": "already_joined",
+                "success": True,
+                "message": "Already a member, database synced"
+            }
 
         if not result.get("error"):
             self.joined_channels.add(chat_username)
@@ -365,11 +425,10 @@ class ActionExecutor:
 
             # Update database - mark chat as joined with correct type
             try:
-                from database import get_account, update_chat_joined
-                account = get_account(session_id)
-                if account:
-                    account_id = account['id']
-                    update_chat_joined(account_id, chat_username, real_chat_type)
+                from database import update_chat_joined
+                acc = get_account(session_id)
+                if acc:
+                    update_chat_joined(acc['id'], chat_username, real_chat_type)
                     logger.info(f"✅ Marked {chat_username} as joined (type: {real_chat_type})")
                 else:
                     logger.warning(f"Could not find account for session {session_id} to update joined status")
@@ -570,11 +629,13 @@ class ActionExecutor:
                         logger.warning(f"   ⚠️ All {len(messages)} fetched messages were already read (ID <= {read_inbox_max_id})")
                         logger.warning(f"   This suggests API returned wrong offset. Expected ID > {read_inbox_max_id}")
 
-                    # Параметры случайного поведения
-                    skip_probability = 0.15 if len(messages_sorted) >= 3 else 0  # 15% быстрое пролистывание
-                    react_probability = 0.10  # 10% шанс поставить реакцию (если есть реакции на сообщении)
-                    save_probability = 0.05   # 5% шанс сохранить в избранное (длинные сообщения >200)
-                    save_probability_short = 0.03  # 3% шанс для коротких сообщений
+                    # Параметры случайного поведения из behavioral profile
+                    bp = getattr(self, '_current_profile', None) or DEFAULT_BEHAVIORAL_PROFILE
+                    bp_eng = bp.get("engagement", DEFAULT_BEHAVIORAL_PROFILE["engagement"])
+                    skip_probability = bp_eng.get("skip_probability", 0.15) if len(messages_sorted) >= 3 else 0
+                    react_probability = bp_eng.get("react_probability", 0.10)
+                    save_probability = bp_eng.get("save_probability_long", 0.05)
+                    save_probability_short = bp_eng.get("save_probability_short", 0.03)
                     
                     # ВАЖНО: Ограничиваем время на чтение чтобы успеть вызвать mark_read
                     time_budget = duration - 2.0  # Оставляем 2 секунды на mark_read
@@ -599,14 +660,22 @@ class ActionExecutor:
                             # Быстрое пролистывание - не вникая
                             msg_read_time = random.uniform(0.3, 0.8)
                         else:
-                            # Реальное чтение: 3-6 символов в секунду
+                            # Реальное чтение с параметрами из behavioral profile
+                            bp_read = bp.get("reading", DEFAULT_BEHAVIORAL_PROFILE["reading"])
                             base_time = 1.0
-                            reading_speed = random.uniform(3, 6)
+                            reading_speed = random.uniform(
+                                bp_read.get("speed_min", 3),
+                                bp_read.get("speed_max", 6)
+                            )
                             reading_time = text_length / reading_speed if text_length > 0 else 0
-                            thinking_time = random.uniform(0.5, 2.0)
-                            
+                            thinking_time = random.uniform(
+                                bp_read.get("thinking_time_min", 0.5),
+                                bp_read.get("thinking_time_max", 2.0)
+                            )
+
                             msg_read_time = base_time + reading_time + thinking_time
-                            msg_read_time = min(msg_read_time, 5.0)  # Максимум 5 сек на сообщение
+                            max_read = bp_read.get("max_read_time", 5.0)
+                            msg_read_time = min(msg_read_time, max_read)
                         
                         actual_read_time += msg_read_time
                         
@@ -886,12 +955,44 @@ class ActionExecutor:
         }
     
     async def _react_to_message(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
-        """React to a message in a channel - only uses reactions that are already present"""
-        channel_username = action.get("channel_username")
-        
+        """React to a message - DISABLED for channels, only allowed in groups"""
+        channel_username = action.get("channel_username") or action.get("chat_username")
+
         if not channel_username:
             return {"error": "Missing channel_username"}
-        
+
+        # DISABLED: Reactions in channels are too risky
+        # Check if this is a channel (not a group)
+        account = get_account(session_id)
+        if not account:
+            logger.error(f"❌ Account not found for session {session_id} - blocking reaction for safety")
+            return {
+                "action": "react_to_message",
+                "channel": channel_username,
+                "status": "error",
+                "reason": "Account not found in database"
+            }
+
+        account_id = account.get("id")
+        from database import get_db_connection
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT chat_type FROM discovered_chats WHERE account_id = ? AND chat_username = ?",
+                (account_id, channel_username)
+            )
+            row = cursor.fetchone()
+            if row:
+                chat_type = row['chat_type']
+                if chat_type == 'channel':
+                    logger.info(f"🚫 Reactions in CHANNELS disabled - skipping {channel_username}")
+                    return {
+                        "action": "react_to_message",
+                        "channel": channel_username,
+                        "status": "skipped",
+                        "reason": "Reactions in channels disabled"
+                    }
+
         # Get recent messages from the channel first
         messages_result = await self.telegram_client.get_channel_messages(
             session_id, 
@@ -1100,28 +1201,37 @@ class ActionExecutor:
     
     async def _reply_in_chat(self, session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Reply to a message in a chat with context-aware response.
-
-        Phase 2 enhanced version:
-        - Analyzes chat context before responding
-        - Generates contextual response if not provided
-        - Tracks participation statistics
-        - Only allows status=0 accounts to write to real public chats
+        Reply to a message in a chat - DISABLED for public chats.
+        Only private bot groups are allowed.
         """
         from database import (
             get_account, update_account, get_persona,
             can_send_message_in_chat, increment_chat_messages_sent,
-            is_private_bot_group
+            is_private_bot_group, save_sent_message, get_account_messages_in_chat
         )
-        from chat_context_analyzer import ChatContextAnalyzer
-        from admin_api_client import AdminAPIClient
 
         chat_username = action.get("chat_username")
-        reply_text = action.get("reply_text", "")
-        use_context_analysis = action.get("use_context_analysis", True)
 
         if not chat_username:
             return {"error": "Missing chat_username"}
+
+        # DISABLED: reply_in_chat for PUBLIC chats is too risky
+        # Only allow private bot groups
+        if not is_private_bot_group(chat_username):
+            logger.info(f"🚫 reply_in_chat DISABLED for public chat {chat_username}")
+            return {
+                "action": "reply_in_chat",
+                "chat": chat_username,
+                "status": "skipped",
+                "reason": "reply_in_chat disabled for public chats"
+            }
+
+        # Below code only runs for private bot groups
+        from chat_context_analyzer import ChatContextAnalyzer
+        from admin_api_client import AdminAPIClient
+
+        reply_text = action.get("reply_text", "")
+        use_context_analysis = action.get("use_context_analysis", True)
 
         account = get_account(session_id)
         if not account:
@@ -1157,6 +1267,23 @@ class ActionExecutor:
 
         account_id = account.get("id")
 
+        # Check chat exclusivity for warmup accounts (anti-linking protection)
+        # Multiple warmup accounts should NOT send messages to the same chat
+        if account.get("account_type") == "warmup":
+            from database import is_chat_exclusive_for_warmup
+            is_exclusive, existing_id = is_chat_exclusive_for_warmup(account_id, chat_username)
+            if not is_exclusive:
+                logger.info(
+                    f"⚠️ Chat {chat_username} already has warmup account {existing_id} - "
+                    f"blocking message from account {account_id} to prevent linking"
+                )
+                return {
+                    "action": "reply_in_chat",
+                    "chat": chat_username,
+                    "status": "skipped",
+                    "reason": f"Chat occupied by another warmup account ({existing_id})"
+                }
+
         # Check daily limit for real chats
         if not can_send_message_in_chat(account_id, chat_username):
             logger.info(f"Daily message limit reached for {chat_username}")
@@ -1174,6 +1301,11 @@ class ActionExecutor:
             try:
                 # Get persona for context
                 persona = get_persona(account_id) or {}
+
+                # Get persona's previous messages in this chat (for memory)
+                persona_messages = get_account_messages_in_chat(account_id, chat_username, limit=10)
+                if persona_messages:
+                    logger.info(f"📚 Loaded {len(persona_messages)} previous messages for persona memory")
 
                 # Fetch recent messages
                 resolved = await self.telegram_client.resolve_peer(session_id, chat_username)
@@ -1200,11 +1332,12 @@ class ActionExecutor:
                         "reason": "Not enough messages for context"
                     }
 
-                # Analyze context
+                # Analyze context (with persona memory)
                 analyzer = ChatContextAnalyzer()
                 analysis = await analyzer.analyze_chat_context(
                     messages=messages,
-                    persona=persona
+                    persona=persona,
+                    persona_messages=persona_messages
                 )
 
                 if not analysis.get("should_respond"):
@@ -1222,7 +1355,8 @@ class ActionExecutor:
                     reply_text = await analyzer.generate_contextual_response(
                         messages=messages,
                         persona=persona,
-                        topic_hint=analysis.get("topic")
+                        topic_hint=analysis.get("topic"),
+                        persona_messages=persona_messages
                     )
 
                 if not reply_text:
@@ -1235,12 +1369,16 @@ class ActionExecutor:
 
             except Exception as e:
                 logger.error(f"Error in context analysis: {e}")
-                # Fallback to generic response
-                reply_text = "Интересно! Спасибо за информацию."
+                # Fallback to generic response from behavioral profile
+                bp = getattr(self, '_current_profile', None) or DEFAULT_BEHAVIORAL_PROFILE
+                fallback_phrases = bp.get("fallback_phrases", DEFAULT_BEHAVIORAL_PROFILE["fallback_phrases"])
+                reply_text = random.choice(fallback_phrases)
 
         # Fallback if still no text
         if not reply_text:
-            reply_text = "Интересно! Спасибо за информацию."
+            bp = getattr(self, '_current_profile', None) or DEFAULT_BEHAVIORAL_PROFILE
+            fallback_phrases = bp.get("fallback_phrases", DEFAULT_BEHAVIORAL_PROFILE["fallback_phrases"])
+            reply_text = random.choice(fallback_phrases)
 
         logger.info(f"Replying in {chat_username}: {reply_text[:50]}...")
 
@@ -1249,6 +1387,16 @@ class ActionExecutor:
             return {"error": "Reply text contains potential spam keywords"}
 
         try:
+            # Simulate typing delay based on message length
+            bp = getattr(self, '_current_profile', None) or DEFAULT_BEHAVIORAL_PROFILE
+            bp_msg = bp.get("messaging", DEFAULT_BEHAVIORAL_PROFILE["messaging"])
+            typing_delay = len(reply_text) * random.uniform(
+                bp_msg.get("typing_delay_per_char_min", 0.05),
+                bp_msg.get("typing_delay_per_char_max", 0.10)
+            )
+            typing_delay = min(typing_delay, 45)  # cap at 45 sec
+            await asyncio.sleep(typing_delay)
+
             # Send the message
             result = await self.telegram_client.send_message(
                 session_id,
@@ -1266,8 +1414,13 @@ class ActionExecutor:
                     update_account(session_id, is_frozen=True)
                 return result
 
-            # Success - update statistics
+            # Success - update statistics and save message for audit/memory
             increment_chat_messages_sent(account_id, chat_username)
+
+            # Save message for persona memory and audit
+            context_summary = action.get("reason", "")[:200]
+            save_sent_message(account_id, chat_username, reply_text, context_summary)
+            logger.info(f"💾 Saved message to audit: {chat_username} ({len(reply_text)} chars)")
 
             return {
                 "action": "reply_in_chat",
@@ -1533,15 +1686,20 @@ class ActionExecutor:
         return any(keyword in text_lower for keyword in spam_keywords)
     
     def _get_natural_delay(self) -> float:
-        """Get a randomized natural delay between actions"""
-        min_delay = ACTION_DELAYS["min_between_actions"]
-        max_delay = ACTION_DELAYS["max_between_actions"]
-        
-        # Use a slight bias toward shorter delays for more activity
+        """Get a randomized natural delay between actions using behavioral profile"""
+        bp = getattr(self, '_current_profile', None) or DEFAULT_BEHAVIORAL_PROFILE
+        timing = bp.get("timing", DEFAULT_BEHAVIORAL_PROFILE["timing"])
+
+        min_delay = timing.get("min_action_delay", ACTION_DELAYS["min_between_actions"])
+        max_delay = timing.get("max_action_delay", ACTION_DELAYS["max_between_actions"])
+
         delay = random.uniform(min_delay, max_delay)
-        
-        # Add occasional longer pauses (10% chance)
-        if random.random() < 0.1:
-            delay += random.uniform(5, 10)
+
+        # Add occasional longer pauses
+        pause_prob = timing.get("long_pause_probability", 0.1)
+        if random.random() < pause_prob:
+            extra_min = timing.get("long_pause_extra_min", 5)
+            extra_max = timing.get("long_pause_extra_max", 10)
+            delay += random.uniform(extra_min, extra_max)
         
         return round(delay, 2)

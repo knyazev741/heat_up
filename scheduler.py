@@ -15,6 +15,7 @@ from search_agent import SearchAgent
 from llm_agent import ActionPlannerAgent
 from executor import ActionExecutor
 from config import settings
+from safety_switch import is_warmup_actions_paused
 from database import (
     get_accounts_for_warmup,
     get_account,
@@ -29,9 +30,12 @@ from database import (
     should_skip_warmup,
     acquire_warmup_lock,
     release_warmup_lock,
-    cleanup_stale_warmup_locks
+    cleanup_stale_warmup_locks,
+    count_available_chats_for_account,
+    get_failed_search_queries,
+    save_search_query
 )
-from admin_sync import sync_session_statuses, get_last_sync_time, save_last_sync_time, sync_helper_accounts
+from admin_sync import sync_session_statuses, get_last_sync_time, save_last_sync_time, sync_helper_accounts, verify_account_status_via_api
 from conversation_engine import get_conversation_engine
 from group_engine import get_group_engine
 from real_chat_engine import RealChatEngine
@@ -153,6 +157,11 @@ class WarmupScheduler:
                 logger.info("=" * 80)
                 logger.info("⏰ SCHEDULER CHECK CYCLE")
                 logger.info("=" * 80)
+
+                if is_warmup_actions_paused():
+                    logger.warning("⏸️ Warmup actions paused by safety switch - skipping action cycle")
+                    await asyncio.sleep(settings.scheduler_check_interval)
+                    continue
                 
                 # Check if we need to sync from Admin API
                 if settings.admin_sync_enabled:
@@ -198,9 +207,11 @@ class WarmupScheduler:
                         if await self._should_warmup_now(account):
                             logger.info(f"🔥 Starting warmup for account {account['session_id'][:8]}...")
                             await self.warmup_account(account['id'])
+                            # Anti-linking: random delay between accounts
+                            await asyncio.sleep(random.uniform(15, 60))
                         else:
                             logger.debug(f"Skipping account {account['session_id'][:8]} - not time yet")
-                    
+
                     except Exception as e:
                         logger.error(f"Error processing account {account.get('session_id', 'unknown')}: {e}")
                         continue
@@ -265,9 +276,11 @@ class WarmupScheduler:
         min_daily = account.get("min_daily_activity", 3)
         max_daily = account.get("max_daily_activity", 6)
         
-        # Берем случайное количество активностей из диапазона для этого дня
-        import random
-        daily_count = random.randint(min_daily, max_daily)
+        # Deterministic daily_count per account per day (stable across cycles)
+        import hashlib
+        day_seed = hashlib.md5(f"{datetime.utcnow().date()}_{account['id']}".encode()).hexdigest()
+        day_rng = random.Random(day_seed)
+        daily_count = day_rng.randint(min_daily, max_daily)
         
         # Если никогда не прогревали - точно нужно
         if not last_warmup:
@@ -316,6 +329,10 @@ class WarmupScheduler:
         Args:
             account_id: ID аккаунта в базе данных
         """
+        if is_warmup_actions_paused():
+            logger.warning(f"⏸️ Warmup action blocked by safety switch for account {account_id}")
+            return
+
         # Try to acquire warmup lock - prevents race condition
         if not acquire_warmup_lock(account_id, timeout_minutes=15):
             logger.warning(f"⚠️ Skipping warmup for account {account_id} - already in progress")
@@ -353,7 +370,20 @@ class WarmupScheduler:
                 logger.warning(f"   This session will be excluded from warmup to save LLM tokens")
                 logger.info("=" * 100)
                 return
-            
+
+            # 1.6. Pre-warmup check: verify account status via Admin API (cached 30 min)
+            try:
+                api_problem = await verify_account_status_via_api(session_id)
+                if api_problem:
+                    logger.warning(
+                        f"⚠️ SKIPPING warmup for session {session_id}: {api_problem['reason']}"
+                    )
+                    logger.warning(f"   Admin API status check failed — local DB updated")
+                    logger.info("=" * 100)
+                    return
+            except Exception as e:
+                logger.warning(f"Pre-warmup API check error for {session_id} (continuing): {e}")
+
             # Задержка для новых сессий теперь проверяется в _should_warmup_now(),
             # поэтому здесь она не нужна - такие сессии не попадут в warmup_account
             
@@ -376,32 +406,44 @@ class WarmupScheduler:
                 logger.info(f"✅ Persona loaded: {persona.get('generated_name')}")
             
             # 3. Обновить пул чатов (если нужно)
-            relevant_chats = get_relevant_chats(account_id, limit=15)
-            
-            # Считаем только каналы с ВЫСОКОЙ релевантностью (>= 0.5) как "доступные"
-            # Низкорелевантные каналы (< 0.5) не дают пользы для прогрева
-            high_relevance_chats = [c for c in relevant_chats if c.get('relevance_score', 0) >= 0.5]
-            
-            logger.info(f"📊 Chats: {len(relevant_chats)} total, {len(high_relevance_chats)} high relevance (>=0.5)")
-            
+            # Используем count_available_chats_for_account для учёта эксклюзивности
+            # (чаты занятые другими warmup-аккаунтами не считаются доступными)
+            chat_counts = count_available_chats_for_account(account_id, min_relevance=0.5)
+
+            available_chats = chat_counts["available_for_participation"]
+            blocked_chats = chat_counts["blocked_by_exclusivity"]
+            total_discovered = chat_counts["total_discovered"]
+            joined_chats = chat_counts["joined"]
+
+            logger.info(
+                f"📊 Chats: {total_discovered} discovered, {joined_chats} joined, "
+                f"{available_chats} available for participation, "
+                f"{blocked_chats} blocked by exclusivity"
+            )
+
             # Проверяем когда последний раз искали каналы
-            # Время ожидания зависит от количества релевантных каналов:
-            # 0 каналов = 1 день, 1-2 = 2 дня, 3-4 = 3 дня, 5+ = 5 дней
+            # Время ожидания зависит от количества ДОСТУПНЫХ чатов (с учётом эксклюзивности):
+            # 0 = 1 день, 1-2 = 2 дня, 3-4 = 3 дня, 5+ = 5 дней
             should_search_chats = False
-            if len(high_relevance_chats) < 5 and persona:
+            if available_chats < 5 and persona:
                 # Вычисляем минимальное время ожидания
-                if len(high_relevance_chats) == 0:
-                    min_days_wait = 1  # Критично мало каналов - искать через 1 день
-                elif len(high_relevance_chats) <= 2:
-                    min_days_wait = 2  # Мало каналов - искать через 2 дня
-                elif len(high_relevance_chats) <= 4:
+                if available_chats == 0:
+                    min_days_wait = 1  # Критично мало - искать через 1 день
+                elif available_chats <= 2:
+                    min_days_wait = 2  # Мало - искать через 2 дня
+                elif available_chats <= 4:
                     min_days_wait = 3  # Почти достаточно - искать через 3 дня
                 else:
                     min_days_wait = 5  # Нормально - стандартные 5 дней
-                
+
+                # Если много чатов заблокировано эксклюзивностью - искать чаще
+                if blocked_chats >= 3:
+                    min_days_wait = max(1, min_days_wait - 1)
+                    logger.info(f"🔒 {blocked_chats} chats blocked by exclusivity - reducing wait time")
+
                 # Проверяем последний discovered_at
                 import sqlite3
-                
+
                 conn = sqlite3.connect('data/sessions.db')
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -411,33 +453,55 @@ class WarmupScheduler:
                 """, (account_id,))
                 row = cursor.fetchone()
                 conn.close()
-                
+
                 if row and row[0]:
                     last_search = datetime.fromisoformat(row[0])
                     days_since_search = (datetime.utcnow() - last_search).days
-                    
+
                     if days_since_search >= min_days_wait:
-                        logger.info(f"📅 Last search was {days_since_search} days ago (need {min_days_wait} for {len(high_relevance_chats)} rel chats) - will search")
+                        logger.info(f"📅 Last search was {days_since_search} days ago (need {min_days_wait} for {available_chats} available chats) - will search")
                         should_search_chats = True
                     else:
                         wait_more = min_days_wait - days_since_search
-                        logger.info(f"⏳ Last search was {days_since_search} days ago - wait {wait_more} more days (have {len(high_relevance_chats)} rel chats)")
+                        logger.info(f"⏳ Last search was {days_since_search} days ago - wait {wait_more} more days (have {available_chats} available chats)")
                 else:
                     # Никогда не искали - можно искать
                     logger.info("🆕 Never searched for chats - will search now")
                     should_search_chats = True
-            
+
             if should_search_chats:
                 logger.info("🔍 Finding relevant chats for persona...")
                 try:
+                    # Get previous failed queries to avoid repeating them
+                    failed_queries = get_failed_search_queries(account_id, limit=15)
+                    if failed_queries:
+                        logger.info(f"🧠 Avoiding {len(failed_queries)} previously failed queries")
+
                     new_chats = await self.search_agent.find_relevant_chats(
                         persona,
-                        limit=settings.search_chats_per_persona
+                        limit=settings.search_chats_per_persona,
+                        failed_queries=failed_queries if failed_queries else None,
+                        account_id=account_id
                     )
-                    
+
+                    joined_count = 0
                     for chat in new_chats:
-                        save_discovered_chat(account_id, chat)
-                    
+                        result = save_discovered_chat(account_id, chat)
+                        if result:
+                            joined_count += 1
+
+                    # Save search queries for history
+                    # (simplified - save one summary query)
+                    if persona:
+                        summary_query = f"{persona.get('city', '')} {' '.join(persona.get('interests', [])[:2])}"
+                        save_search_query(
+                            account_id=account_id,
+                            query=summary_query,
+                            results_count=len(new_chats),
+                            chats_found=len(new_chats),
+                            chats_joined=joined_count
+                        )
+
                     logger.info(f"✅ Added {len(new_chats)} new chats")
                 except Exception as e:
                     logger.error(f"Error finding chats: {e}")
@@ -456,7 +520,8 @@ class WarmupScheduler:
             logger.info("⚡ Executing actions...")
             execution_summary = await self.executor.execute_action_plan(
                 session_id,
-                actions
+                actions,
+                account_id=account_id
             )
             
             # 6. Сохранить результаты
@@ -522,8 +587,8 @@ class WarmupScheduler:
         if responses_sent > 0:
             logger.info(f"   Sent {responses_sent} conversation responses")
 
-        # 2. Start new conversations (higher probability for more social activity)
-        if random.random() < 0.7:  # 70% chance per cycle
+        # 2. Start new conversations (reduced probability to avoid bot detection)
+        if random.random() < 0.25:  # 25% chance per cycle (reduced from 70%)
             new_convs = await self.conversation_engine.initiate_new_social_activities()
             if new_convs > 0:
                 logger.info(f"   Started {new_convs} new conversations")
@@ -545,8 +610,13 @@ class WarmupScheduler:
         if messages_sent > 0:
             logger.info(f"   Sent {messages_sent} group messages")
 
-        # 2. Create new groups (moderate probability for warmup-helper groups)
-        if random.random() < 0.3:  # 30% chance per cycle
+        # 1b. Process pending group joins (gradual member addition)
+        pending_joins = await self.group_engine.process_pending_group_joins()
+        if pending_joins > 0:
+            logger.info(f"   Processed {pending_joins} pending group joins")
+
+        # 2. Create new groups (low probability to avoid bot detection)
+        if random.random() < 0.10:  # 10% chance per cycle (reduced from 30%)
             new_groups = await self.group_engine.initiate_new_group_activities()
             if new_groups > 0:
                 logger.info(f"   Created {new_groups} new groups")
