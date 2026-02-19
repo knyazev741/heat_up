@@ -372,15 +372,25 @@ class WarmupScheduler:
                 return
 
             # 1.6. Pre-warmup check: verify account status via Admin API (cached 30 min)
+            passive_only = False
             try:
                 api_problem = await verify_account_status_via_api(session_id)
                 if api_problem:
-                    logger.warning(
-                        f"⚠️ SKIPPING warmup for session {session_id}: {api_problem['reason']}"
-                    )
-                    logger.warning(f"   Admin API status check failed — local DB updated")
-                    logger.info("=" * 100)
-                    return
+                    if api_problem.get("passive_only"):
+                        # status=1: account is sending broadcasts — allow passive warmup only
+                        passive_only = True
+                        logger.info(
+                            f"👁️ PASSIVE WARMUP for session {session_id}: {api_problem['reason']}"
+                        )
+                        logger.info(f"   Will do read/view/idle only — no messages or joins")
+                    else:
+                        # Hard problem (deleted/frozen) — skip entirely
+                        logger.warning(
+                            f"⚠️ SKIPPING warmup for session {session_id}: {api_problem['reason']}"
+                        )
+                        logger.warning(f"   Admin API status check failed — local DB updated")
+                        logger.info("=" * 100)
+                        return
             except Exception as e:
                 logger.warning(f"Pre-warmup API check error for {session_id} (continuing): {e}")
 
@@ -406,6 +416,10 @@ class WarmupScheduler:
                 logger.info(f"✅ Persona loaded: {persona.get('generated_name')}")
             
             # 3. Обновить пул чатов (если нужно)
+            # Skip chat search in passive mode — no point joining new chats
+            if passive_only:
+                logger.info("👁️ Passive mode — skipping chat discovery and joining")
+
             # Используем count_available_chats_for_account для учёта эксклюзивности
             # (чаты занятые другими warmup-аккаунтами не считаются доступными)
             chat_counts = count_available_chats_for_account(account_id, min_relevance=0.5)
@@ -425,7 +439,7 @@ class WarmupScheduler:
             # Время ожидания зависит от количества ДОСТУПНЫХ чатов (с учётом эксклюзивности):
             # 0 = 1 день, 1-2 = 2 дня, 3-4 = 3 дня, 5+ = 5 дней
             should_search_chats = False
-            if available_chats < 5 and persona:
+            if available_chats < 5 and persona and not passive_only:
                 # Вычисляем минимальное время ожидания
                 if available_chats == 0:
                     min_days_wait = 1  # Критично мало - искать через 1 день
@@ -507,11 +521,15 @@ class WarmupScheduler:
                     logger.error(f"Error finding chats: {e}")
             
             # 4. Сгенерировать план действий
-            logger.info("🎬 Generating action plan...")
+            if passive_only:
+                logger.info("🎬 Generating PASSIVE action plan (status=1)...")
+            else:
+                logger.info("🎬 Generating action plan...")
             actions = await self.action_planner.generate_action_plan(
                 session_id,
                 account_data=account,
-                persona_data=persona
+                persona_data=persona,
+                passive_only=passive_only
             )
             
             logger.info(f"✅ Generated {len(actions)} actions")
@@ -521,7 +539,8 @@ class WarmupScheduler:
             execution_summary = await self.executor.execute_action_plan(
                 session_id,
                 actions,
-                account_id=account_id
+                account_id=account_id,
+                passive_only=passive_only
             )
             
             # 6. Сохранить результаты

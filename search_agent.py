@@ -64,92 +64,253 @@ class SearchAgent:
     async def find_relevant_chats(
         self,
         persona: Dict[str, Any],
-        limit: int = 20
+        limit: int = 20,
+        failed_queries: List[str] = None,
+        account_id: int = None
     ) -> List[Dict[str, Any]]:
         """
-        Ищет РЕАЛЬНЫЕ Telegram-чаты через Google Custom Search API + web scraping
-        
+        Ищет УНИКАЛЬНЫЕ Telegram-чаты через Google + web scraping.
+
+        КРИТИЧНО: Проверяет что найденные каналы НЕ заняты другими warmup аккаунтами.
+        Если все заняты - генерирует НОВЫЕ запросы через LLM.
+
         Args:
             persona: Словарь с данными персоны
             limit: Максимальное количество чатов
-            
+            failed_queries: Предыдущие запросы которые не сработали
+            account_id: ID аккаунта для проверки эксклюзивности
+
         Returns:
-            Список чатов с метаданными
+            Список УНИКАЛЬНЫХ чатов (не занятых другими warmup)
         """
-        logger.info(f"🔍 Searching REAL Telegram chats for: {persona.get('generated_name')}")
-        
-        # Проверяем конфигурацию Google API
+        logger.info(f"🔍 Searching UNIQUE chats for: {persona.get('generated_name')} (no city!)")
+
         if not self.google_api_key or not self.google_engine_id:
-            logger.error("Google Search API not configured! Please set GOOGLE_SEARCH_API and GOOGLE_SEARCH_ENGINE_ID in .env")
+            logger.error("Google Search API not configured!")
             return []
-        
-        # Генерируем поисковые запросы
-        queries = self._generate_search_queries(persona)
-        logger.info(f"Generated {len(queries)} search queries")
-        
-        # Ищем в Google и собираем URLs для скрейпинга
-        urls_to_scrape = await self._search_google(queries)
-        logger.info(f"Got {len(urls_to_scrape)} URLs to scrape")
-        
-        if not urls_to_scrape:
-            logger.warning("No URLs found from Google search!")
+
+        # Получаем список каналов занятых другими warmup аккаунтами
+        occupied_channels = []
+        if account_id:
+            occupied_channels = self._get_occupied_channels(account_id)
+            if occupied_channels:
+                logger.info(f"🔒 {len(occupied_channels)} channels occupied by other warmup accounts")
+
+        all_used_queries = list(failed_queries or [])
+        max_retries = 3
+        final_results = []
+
+        for attempt in range(max_retries):
+            logger.info(f"📍 Search attempt {attempt + 1}/{max_retries}")
+
+            # ВСЕГДА используем LLM для уникальных запросов
+            queries = await self._generate_smart_queries(
+                persona,
+                all_used_queries,
+                occupied_channels if attempt > 0 else None  # После первой попытки передаём занятые
+            )
+
+            if not queries:
+                logger.warning("LLM failed to generate queries, using fallback")
+                queries = self._generate_search_queries(persona)
+
+            all_used_queries.extend(queries)
+            logger.info(f"Generated {len(queries)} queries")
+
+            # Поиск Google
+            urls_to_scrape = await self._search_google(queries)
+            if not urls_to_scrape:
+                logger.warning("No URLs from Google, retrying...")
+                continue
+
+            # Скрейпинг
+            all_channels = await self._scrape_websites(urls_to_scrape)
+            if not all_channels:
+                logger.warning("No channels from scraping, retrying...")
+                continue
+
+            # Фильтруем занятые каналы
+            available_channels = {}
+            for username, data in all_channels.items():
+                clean_username = username.lower().replace('@', '')
+                if not any(clean_username == occ.lower().replace('@', '') for occ in occupied_channels):
+                    available_channels[username] = data
+                else:
+                    logger.debug(f"  ✗ Skipping occupied: {username}")
+
+            logger.info(f"📊 Found {len(all_channels)} channels, {len(available_channels)} available (not occupied)")
+
+            if available_channels:
+                # LLM ранжирование
+                ranked = await self._rank_chats_with_llm(persona, list(available_channels.values()))
+                final_results.extend(ranked)
+
+                # Добавляем найденные в список занятых для следующих итераций
+                for chat in ranked:
+                    username = chat.get('username', '').replace('@', '')
+                    if username:
+                        occupied_channels.append(username)
+
+            if len(final_results) >= limit:
+                break
+
+            if attempt < max_retries - 1:
+                logger.info(f"🔄 Need more unique channels, retrying with different queries...")
+
+        logger.info(f"✅ Final: {len(final_results)} unique available channels")
+        return final_results[:limit]
+
+    def _get_occupied_channels(self, account_id: int) -> List[str]:
+        """Получает список каналов занятых другими warmup аккаунтами"""
+        try:
+            from database import get_db_connection
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT DISTINCT dc.chat_username
+                    FROM discovered_chats dc
+                    JOIN accounts a ON dc.account_id = a.id
+                    WHERE dc.is_joined = 1
+                    AND a.account_type = 'warmup'
+                    AND a.is_active = 1
+                    AND a.is_frozen = 0
+                    AND a.is_deleted = 0
+                    AND dc.account_id != ?
+                """, (account_id,))
+                return [row['chat_username'].replace('@', '') for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting occupied channels: {e}")
             return []
-        
-        # Скрейпим сайты параллельно
-        all_channels = await self._scrape_websites(urls_to_scrape)
-        logger.info(f"Found {len(all_channels)} UNIQUE channels after scraping")
-        
-        if not all_channels:
-            logger.warning("No channels found via web scraping!")
-            return []
-        
-        # LLM ранжирует по релевантности
-        ranked_chats = await self._rank_chats_with_llm(persona, list(all_channels.values()))
-        
-        return ranked_chats[:limit]
     
-    def _generate_search_queries(self, persona: Dict[str, Any]) -> List[str]:
+    async def _generate_smart_queries(
+        self,
+        persona: Dict[str, Any],
+        failed_queries: List[str],
+        occupied_channels: List[str] = None
+    ) -> List[str]:
         """
-        Генерирует поисковые запросы с приоритетом на ГРУППЫ (не каналы).
+        Использует LLM для генерации УНИКАЛЬНЫХ поисковых запросов.
 
-        Phase 2: Приоритет на группы где можно писать, а не каналы только для чтения.
+        КРИТИЧНО: НЕ использует город! Только интересы и хобби.
+        Это предотвращает нахождение одних и тех же каналов разными аккаунтами.
+
+        Args:
+            persona: Данные персоны
+            failed_queries: Запросы которые уже пробовали
+            occupied_channels: Каналы уже занятые другими warmup аккаунтами
+
+        Returns:
+            Список уникальных запросов
         """
-
-        city = persona.get('city', 'Москва')
         interests = persona.get('interests', [])
         occupation = persona.get('occupation', '')
+        hobbies = persona.get('hobbies', interests)
+        personality = persona.get('personality_traits', [])
+
+        failed_list = "\n".join([f"  - {q}" for q in failed_queries[:15]]) if failed_queries else "Нет"
+        occupied_list = "\n".join([f"  - {ch}" for ch in (occupied_channels or [])[:20]]) if occupied_channels else "Нет"
+
+        prompt = f"""Придумай УНИКАЛЬНЫЕ поисковые запросы для Google чтобы найти Telegram-группы.
+
+ИНТЕРЕСЫ ЧЕЛОВЕКА:
+- Профессия: {occupation or 'не указана'}
+- Интересы: {', '.join(interests[:6]) if interests else 'разные'}
+- Хобби: {', '.join(hobbies[:6]) if hobbies else 'разные'}
+- Характер: {', '.join(personality[:3]) if personality else 'общительный'}
+
+ПРЕДЫДУЩИЕ ЗАПРОСЫ (НЕ ПОВТОРЯЙ!):
+{failed_list}
+
+КАНАЛЫ КОТОРЫЕ УЖЕ ЗАНЯТЫ (нужны ДРУГИЕ!):
+{occupied_list}
+
+ЗАДАЧА:
+Придумай 10 УНИКАЛЬНЫХ поисковых запросов чтобы найти Telegram-ГРУППЫ для общения.
+
+КРИТИЧНЫЕ ПРАВИЛА:
+1. НЕ используй названия городов или регионов!
+2. Фокусируйся ТОЛЬКО на интересах и хобби
+3. Ищи НИШЕВЫЕ группы - узкоспециализированные сообщества
+4. Каждый запрос должен быть про РАЗНЫЕ темы
+5. Используй специфичные термины из хобби
+6. Ищи группы для обсуждений, не новостные каналы
+
+ПРИМЕРЫ ХОРОШИХ ЗАПРОСОВ:
+- "telegram группа любителей комнатных растений чат"
+- "t.me сообщество ретро игры обсуждение"
+- "telegram чат фотографы природа"
+
+ФОРМАТ - только запросы, по одному на строку:
+"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0.95,  # Высокая креативность
+                max_tokens=600,
+                messages=[
+                    {"role": "system", "content": "Генерируй только уникальные поисковые запросы. Без городов и регионов!"},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+
+            response_text = response.choices[0].message.content.strip()
+
+            queries = []
+            for line in response_text.split('\n'):
+                line = line.strip()
+                line = re.sub(r'^[\d]+[.\)]\s*', '', line)
+                line = re.sub(r'^[-•]\s*', '', line)
+                if line and len(line) > 5 and line not in (failed_queries or []):
+                    queries.append(line)
+
+            logger.info(f"🧠 LLM generated {len(queries)} unique queries (no city!)")
+            return queries[:15]
+
+        except Exception as e:
+            logger.error(f"Error generating smart queries: {e}")
+            return self._generate_search_queries(persona)
+
+    def _generate_search_queries(self, persona: Dict[str, Any]) -> List[str]:
+        """
+        Генерирует базовые поисковые запросы БЕЗ ГОРОДА.
+
+        КРИТИЧНО: Не используем город чтобы разные аккаунты не находили
+        одни и те же региональные каналы.
+        """
+        interests = persona.get('interests', [])
+        occupation = persona.get('occupation', '')
+        hobbies = persona.get('hobbies', interests)
 
         queries = []
 
-        # ВЫСШИЙ ПРИОРИТЕТ: Публичные группы города (можно писать!)
-        queries.extend([
-            f"{city} telegram группа чат общение",
-            f"telegram чат жителей {city}",
-            f"публичная группа telegram {city}",
-            f"t.me чат {city} общение",
-            f"{city} telegram group chat community",
-        ])
-
-        # ТЕМАТИЧЕСКИЕ ГРУППЫ по интересам (приоритет на группы!)
-        for interest in interests[:4]:  # Топ-4 интереса
+        # ТЕМАТИЧЕСКИЕ ГРУППЫ по интересам (без города!)
+        for interest in interests[:5]:
             queries.extend([
-                f"telegram группа {interest} {city}",
-                f"telegram чат {interest} обсуждение",
-                f"t.me {interest} группа чат",
-                f"публичный чат {interest} telegram",
+                f"telegram группа {interest} обсуждение чат",
+                f"t.me {interest} сообщество группа",
+                f"telegram chat {interest} community",
             ])
+
+        # ХОББИ группы
+        for hobby in hobbies[:3]:
+            if hobby not in interests:
+                queries.append(f"telegram группа любителей {hobby}")
 
         # ПРОФЕССИОНАЛЬНЫЕ группы
         if occupation:
             queries.extend([
-                f"telegram группа {occupation}",
-                f"telegram чат {occupation} сообщество",
+                f"telegram группа {occupation} общение",
+                f"telegram чат {occupation} сообщество профессионалы",
             ])
 
-        # РЕГИОНАЛЬНЫЕ группы (низший приоритет для каналов)
-        queries.append(f"telegram канал {city} новости")
+        # Общие тематические
+        queries.extend([
+            "telegram группа по интересам общение",
+            "t.me публичная группа чат обсуждение",
+        ])
 
-        return queries[:20]  # Макс 20 запросов для Phase 2
+        return queries[:15]
     
     async def _search_google(self, queries: List[str]) -> List[Dict[str, Any]]:
         """
@@ -333,7 +494,11 @@ class SearchAgent:
             'badoo', 'tinder', 'bumble', 'hinge', 'okcupid',
             'magenta', 'telekom', 'vodafone', 'orange', 't-mobile',
             'katyperry', 'justinbieber', 'arianagrande', 'selenagomez',
-            'telegram'  # Общий канал Telegram
+            'telegram',  # Общий канал Telegram
+            # TGStat и связанные каналы/боты — КРИТИЧНО! Вступление в них связывает аккаунты!
+            'tgstat', 'tgstat_chat', 'tgstatapi', 'tgstat_bot', 'tgstatchatbot',
+            'tgalertsbot', 'tg_analytics_bot', 'searcheebot', 'telepulse',
+            'share',  # Популярный канал с пересечениями
         }
         
         # 1. ПРИОРИТЕТ: Ищем все t.me/ ссылки в <a> тегах

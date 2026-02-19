@@ -52,7 +52,8 @@ class ActionExecutor:
         self,
         session_id: str,
         actions: List[Dict[str, Any]],
-        account_id: int = None
+        account_id: int = None,
+        passive_only: bool = False
     ) -> Dict[str, Any]:
         """
         Execute a sequence of actions
@@ -61,6 +62,7 @@ class ActionExecutor:
             session_id: Telegram session UID
             actions: List of actions to perform
             account_id: Account ID for loading behavioral profile
+            passive_only: If True, skip aggressive actions (join, send, reply, etc.)
 
         Returns:
             Execution summary with results
@@ -71,7 +73,18 @@ class ActionExecutor:
         else:
             self._current_profile = DEFAULT_BEHAVIORAL_PROFILE.copy()
 
-        logger.info(f"Starting action execution for session {session_id} with {len(actions)} actions")
+        # Safety net: filter out aggressive actions in passive mode
+        if passive_only:
+            PASSIVE_ACTIONS = {"read_messages", "view_profile", "idle"}
+            original_count = len(actions)
+            actions = [a for a in actions if a.get("action") in PASSIVE_ACTIONS]
+            if len(actions) < original_count:
+                logger.warning(
+                    f"👁️ Passive mode: filtered {original_count - len(actions)} aggressive actions, "
+                    f"keeping {len(actions)} passive actions"
+                )
+
+        logger.info(f"Starting action execution for session {session_id} with {len(actions)} actions" + (" [PASSIVE]" if passive_only else ""))
         
         results = []
         errors = []

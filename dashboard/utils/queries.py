@@ -71,11 +71,14 @@ def get_kpi_stats() -> Dict[str, int]:
 def get_ready_accounts_count() -> int:
     """
     Get count of 'ready' accounts.
-    Ready = warmup_stage >= 5, is_premium=0, status=0 in Admin API.
+    Ready = warmup_stage >= 5, is_premium=false, status=0 in Admin API.
 
     First queries local DB for accounts with stage >= 5,
-    then verifies they are ready in Admin API.
+    then verifies they are ready in Admin API (not premium, status=0).
     """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -90,50 +93,54 @@ def get_ready_accounts_count() -> int:
         AND warmup_stage >= 5
     """)
 
-    local_ready_sessions = {row[0] for row in cursor.fetchall()}
+    local_ready_sessions = {str(row[0]) for row in cursor.fetchall()}
     conn.close()
 
     if not local_ready_sessions:
         return 0
 
     try:
-        # Load Admin API config
-        api_config_path = Path(__file__).parent.parent.parent / "data" / "adminapi.json"
-        if not api_config_path.exists():
-            return len(local_ready_sessions)  # Return local count if no API config
+        # Use the proper AdminAPIClient with correct auth from .env
+        from admin_api_client import AdminAPIClient
+        from config import settings
+        import asyncio
 
-        with open(api_config_path) as f:
-            config = json.load(f)
+        async def check_ready():
+            client = AdminAPIClient()
+            try:
+                # Get sessions with status=0, is_premium=false (ready for work)
+                result = await client.get_sessions(
+                    status=0,
+                    is_premium=False,
+                    deleted=False,
+                    limit=200
+                )
+                sessions = result.get("items", [])
 
-        base_url = config.get("base_url", "")
-        api_key = config.get("api_key", "")
+                # Extract session IDs that are ready in Admin API
+                api_ready_ids = {str(s.get("id")) for s in sessions
+                                if not s.get("is_premium") and s.get("status") == 0}
 
-        if not base_url or not api_key:
+                # Count accounts that are both locally ready AND ready in Admin API
+                ready_count = len(local_ready_sessions & api_ready_ids)
+                return ready_count
+            finally:
+                await client.close()
+
+        # Run async check
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If already in async context, create task
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, check_ready())
+                    return future.result(timeout=10)
+            else:
+                return asyncio.run(check_ready())
+        except Exception:
             return len(local_ready_sessions)
 
-        # Call Admin API for accounts with status=0, is_premium=false
-        headers = {"Authorization": f"Token {api_key}"}
-        response = httpx.get(
-            f"{base_url}/api/v1/sessions/",
-            params={"status": 0, "is_premium": "false", "deleted": "false"},
-            headers=headers,
-            timeout=10.0
-        )
-
-        if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, dict) and "results" in data:
-                api_sessions = {s.get("session_id") or s.get("id") for s in data["results"]}
-            elif isinstance(data, list):
-                api_sessions = {s.get("session_id") or s.get("id") for s in data}
-            else:
-                return len(local_ready_sessions)
-
-            # Count accounts that are both in local ready set AND in API with correct status
-            ready_count = len(local_ready_sessions & api_sessions)
-            return ready_count if ready_count > 0 else len(local_ready_sessions)
-
-        return len(local_ready_sessions)
     except Exception:
         return len(local_ready_sessions)
 

@@ -390,15 +390,26 @@ async def verify_account_status_via_api(session_id: str) -> Optional[Dict[str, A
     if is_frozen:
         problems.append("frozen in Admin API")
         _update_local_status(session_id, is_frozen=True)
-    if status == 1:
-        problems.append("status=1 (in work, sending broadcasts)")
 
+    # Hard problems (deleted/frozen) → skip warmup entirely
     if problems:
         result = {
             "reason": "; ".join(problems),
             "deleted": is_deleted,
             "frozen": is_frozen,
             "status": status,
+        }
+        _status_cache[session_id] = (result, now)
+        return result
+
+    # Soft issue: status=1 → passive warmup only (read, view, idle — no messages)
+    if status == 1:
+        result = {
+            "reason": "status=1 (in work, sending broadcasts) — passive warmup only",
+            "deleted": False,
+            "frozen": False,
+            "status": status,
+            "passive_only": True,
         }
         _status_cache[session_id] = (result, now)
         return result

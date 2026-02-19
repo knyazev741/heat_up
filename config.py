@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     
     # Admin API sync settings
     admin_sync_enabled: bool = True  # Enable automatic sync from Admin API
-    admin_sync_interval_hours: int = 24  # Sync every 24 hours (once per day)
+    admin_sync_interval_hours: float = 0.5  # Sync every 30 minutes
     
     # Warmup stages
     warmup_max_stage: int = 14  # 14 дней базового прогрева
@@ -361,6 +361,13 @@ CHAT_LIMITS = {
         14: 15,  # На 14-й стадии - до 15 групп (максимум)
     },
     # Каналы ограничены через max_joins_per_day/session
+}
+
+# Изоляция warmup-аккаунтов (предотвращение связывания)
+WARMUP_ISOLATION = {
+    "total_messages_per_chat_limit": 7,   # Макс. сообщений в чат за весь период прогрева
+    "chat_exclusivity_enabled": True,      # Один warmup-аккаунт на чат
+    "daily_messages_per_chat_limit": 3,    # Макс. сообщений в чат в день (существующий лимит)
 }
 
 

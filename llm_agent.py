@@ -20,15 +20,16 @@ class ActionPlannerAgent:
         )
         self.model = "deepseek-chat"  # DeepSeek model for better cost efficiency
         
-    def _build_prompt(self, session_id: str, account_data: Dict[str, Any] = None, persona_data: Dict[str, Any] = None) -> str:
+    def _build_prompt(self, session_id: str, account_data: Dict[str, Any] = None, persona_data: Dict[str, Any] = None, passive_only: bool = False) -> str:
         """
         Build the system prompt for action generation based on session history, persona, and warmup stage
-        
+
         Args:
             session_id: Telegram session UID
             account_data: Account information from database
             persona_data: Persona information from database
-            
+            passive_only: If True, restrict to passive actions only (read, view, idle)
+
         Returns:
             System prompt string
         """
@@ -290,28 +291,6 @@ class ActionPlannerAgent:
         actions_list = []
         action_num = 1
 
-        # update_profile - доступно с вероятностью 20% и только если профиль еще не обновлялся
-        # и аккаунт не совсем новый (минимум стадия 3)
-        import random
-        profile_update_probability = 0.20  # 20% шанс
-        should_allow_profile_update = (
-            not has_updated_profile and
-            not is_brand_new and
-            warmup_stage >= 3 and
-            random.random() < profile_update_probability
-        )
-
-        if should_allow_profile_update:
-            logger.info(f"✅ update_profile ВКЛЮЧЕН для {session_id} (вероятность {profile_update_probability*100:.0f}%, stage={warmup_stage})")
-            actions_list.append(f"""
-{action_num}. update_profile (ОПЦИОНАЛЬНО - только bio):
-   {{"action": "update_profile", "bio": "Краткое описание о себе на русском", "reason": "Персонализация"}}
-   ВАЖНО: Обновляй ТОЛЬКО bio! НЕ меняй имя/фамилию! Bio должно быть коротким (до 70 символов).""")
-            action_num += 1
-        else:
-            reason = "уже обновлен" if has_updated_profile else "новый аккаунт" if is_brand_new else f"stage {warmup_stage}<3" if warmup_stage < 3 else "не выпало по вероятности"
-            logger.info(f"🚫 update_profile ОТКЛЮЧЕН для {session_id} ({reason})")
-        
         # Load behavioral profile for personalized examples
         account_id = account_data.get("id") if account_data else None
         bp = get_behavioral_profile(account_id) if account_id else DEFAULT_BEHAVIORAL_PROFILE
@@ -323,23 +302,65 @@ class ActionPlannerAgent:
         idle_example_dur = int(bp_timing.get("min_action_delay", 3) + bp_timing.get("max_action_delay", 10)) // 2
         view_example_dur = int(bp_read.get("max_read_time", 5))
 
-        # Остальные действия - всегда доступны
-        actions_list.append(f"""
-{action_num}. join_channel (join_chat):
-   {{"action": "join_channel", "channel_username": "@example", "reason": "Интересная тематика"}}""")
-        action_num += 1
+        if passive_only:
+            # PASSIVE MODE: only read, view, idle — no messages, joins, or profile updates
+            logger.info(f"👁️ PASSIVE MODE for {session_id}: only read_messages, view_profile, idle")
 
-        actions_list.append(f"""
+            actions_list.append(f"""
 {action_num}. read_messages:
    {{"action": "read_messages", "channel_username": "@example", "duration_seconds": {read_example_dur}, "reason": "Читаю контент"}}""")
-        action_num += 1
+            action_num += 1
 
-        actions_list.append(f"""
+            actions_list.append(f"""
 {action_num}. idle:
    {{"action": "idle", "duration_seconds": {idle_example_dur}, "reason": "Короткая пауза"}}""")
-        action_num += 1
+            action_num += 1
 
-        actions_list.append(f"""
+            actions_list.append(f"""
+{action_num}. view_profile:
+   {{"action": "view_profile", "channel_username": "@example", "duration_seconds": {view_example_dur}, "reason": "Изучаю чат/канал"}}""")
+
+        else:
+            # NORMAL MODE: full action set
+
+            # update_profile - доступно с вероятностью 20% и только если профиль еще не обновлялся
+            # и аккаунт не совсем новый (минимум стадия 3)
+            import random
+            profile_update_probability = 0.20  # 20% шанс
+            should_allow_profile_update = (
+                not has_updated_profile and
+                not is_brand_new and
+                warmup_stage >= 3 and
+                random.random() < profile_update_probability
+            )
+
+            if should_allow_profile_update:
+                logger.info(f"✅ update_profile ВКЛЮЧЕН для {session_id} (вероятность {profile_update_probability*100:.0f}%, stage={warmup_stage})")
+                actions_list.append(f"""
+{action_num}. update_profile (ОПЦИОНАЛЬНО - только bio):
+   {{"action": "update_profile", "bio": "Краткое описание о себе на русском", "reason": "Персонализация"}}
+   ВАЖНО: Обновляй ТОЛЬКО bio! НЕ меняй имя/фамилию! Bio должно быть коротким (до 70 символов).""")
+                action_num += 1
+            else:
+                reason = "уже обновлен" if has_updated_profile else "новый аккаунт" if is_brand_new else f"stage {warmup_stage}<3" if warmup_stage < 3 else "не выпало по вероятности"
+                logger.info(f"🚫 update_profile ОТКЛЮЧЕН для {session_id} ({reason})")
+
+            actions_list.append(f"""
+{action_num}. join_channel (join_chat):
+   {{"action": "join_channel", "channel_username": "@example", "reason": "Интересная тематика"}}""")
+            action_num += 1
+
+            actions_list.append(f"""
+{action_num}. read_messages:
+   {{"action": "read_messages", "channel_username": "@example", "duration_seconds": {read_example_dur}, "reason": "Читаю контент"}}""")
+            action_num += 1
+
+            actions_list.append(f"""
+{action_num}. idle:
+   {{"action": "idle", "duration_seconds": {idle_example_dur}, "reason": "Короткая пауза"}}""")
+            action_num += 1
+
+            actions_list.append(f"""
 {action_num}. view_profile:
    {{"action": "view_profile", "channel_username": "@example", "duration_seconds": {view_example_dur}, "reason": "Изучаю чат/канал"}}""")
 
@@ -349,6 +370,38 @@ class ActionPlannerAgent:
         behavioral_hints = self._build_behavioral_hints(bp)
 
         # Формируем полный return с динамическим списком действий
+
+        if passive_only:
+            # PASSIVE MODE: simplified prompt — only read, view, idle
+            return f"""{persona_context}
+
+{stage_guidance}
+
+{flags_guidance}
+{history_context}
+{behavioral_hints}
+
+👁️ РЕЖИМ ПАССИВНОГО НАБЛЮДЕНИЯ:
+Сейчас ты просто листаешь Telegram — читаешь каналы, просматриваешь чаты, делаешь паузы.
+НЕ отправляй сообщения, НЕ вступай в новые чаты, НЕ обновляй профиль.
+Только чтение и просмотр — как человек, который просто скроллит ленту.
+
+📋 ДОСТУПНЫЕ ЧАТЫ/КАНАЛЫ (в которые ты УЖЕ вступил):
+{channels_list}
+
+⚠️ ВАЖНО:
+- Используй ТОЛЬКО чаты с пометкой [ВСТУПИЛ ✅]!
+- Действуй ТОЛЬКО через: read_messages, view_profile, idle
+- ЗАПРЕЩЕНЫ: join_channel, reply_to_dm, react_to_message, message_bot, update_profile, send_message
+- Количество действий: от 3 до 10
+
+ДОСТУПНЫЕ ТИПЫ ДЕЙСТВИЙ:
+
+{basic_actions}
+
+Стадия: {warmup_stage}
+Формат ответа - ТОЛЬКО JSON массив, без текста!"""
+
         return f"""{persona_context}
 
 {stage_guidance}
@@ -468,29 +521,30 @@ class ActionPlannerAgent:
         hints_text = "\n".join(f"- {h}" for h in hints)
         return f"\n🎭 ТВОИ ПОВЕДЕНЧЕСКИЕ ОСОБЕННОСТИ:\n{hints_text}"
 
-    async def generate_action_plan(self, session_id: str, account_data: Dict[str, Any] = None, persona_data: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    async def generate_action_plan(self, session_id: str, account_data: Dict[str, Any] = None, persona_data: Dict[str, Any] = None, passive_only: bool = False) -> List[Dict[str, Any]]:
         """
         Generate a natural sequence of actions based on session history, persona, and warmup stage
-        
+
         Args:
             session_id: The Telegram session ID
             account_data: Account information (optional, will be fetched if not provided)
             persona_data: Persona information (optional, will be fetched if not provided)
-            
+            passive_only: If True, generate only passive actions (read, view, idle) — no messages or joins
+
         Returns:
             List of actions to perform
         """
-        logger.info(f"Generating action plan for session {session_id}")
-        
+        logger.info(f"Generating action plan for session {session_id}" + (" [PASSIVE MODE]" if passive_only else ""))
+
         try:
             # Get account data if not provided
             if not account_data:
                 account_data = get_account(session_id) or {}
-            
+
             warmup_stage = account_data.get("warmup_stage", 1)
-            
+
             # Build prompts
-            system_prompt = self._build_prompt(session_id, account_data, persona_data)
+            system_prompt = self._build_prompt(session_id, account_data, persona_data, passive_only=passive_only)
             user_prompt = f"Сгенерируй последовательность действий для стадии {warmup_stage}. Будь креативным и естественным!"
             
             # Log the full conversation being sent to LLM
